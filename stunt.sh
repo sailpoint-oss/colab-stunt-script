@@ -15,6 +15,9 @@ else
 fi
 
 
+#constants
+CHARON_MINIMUM_VERSION="1647"
+
 ### GLOBAL VARIABLES ###
 VERSION="v2.1"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
@@ -380,7 +383,7 @@ detect_old_os_version() {
       update_old_os
       echo 1
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup"
+      echo -e "$YELLOW ACTION: $RESETCOLOR OS is out of date, but the option for "
       echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file"
       echo 1
     fi
@@ -657,6 +660,11 @@ if test -f /etc/systemd/network/static.network; then
   expect "individual DNS entries to be on separate lines beginning with 'DNS'."
   expect "the IP address to include CIDR notation."
   cat /etc/systemd/network/static.network >> "$LOGFILE"
+  if grep -q "DHCP=yes" /etc/systemd/network/static.network; then #check if static.network actually requests DHCP
+    static_network_file_dhcp_yes=true
+  else
+    static_network_file_dhcp_yes=false
+  fi
   outro
 fi
 
@@ -782,9 +790,13 @@ sudo docker exec ccg ls -l /opt/sailpoint/ccg/lib/custom >> "$LOGFILE" 2>&1
 outro
 
 if [[ "$do_fixup" == true ]]; then
-  intro "This step disables esx_dhcp_bump"
+  intro "This step disables esx_dhcp_bump if needed"
   expect "any output stating this was removed/disabled. If there is, be sure to do a sudo reboot."
-  sudo systemctl disable esx_dhcp_bump >> "$LOGFILE" 2>&1
+  if [[ "$static_network_file_dhcp_yes" == false ]]; then
+    sudo systemctl disable esx_dhcp_bump >> "$LOGFILE" 2>&1
+  else
+    echo "Not disabling esx_dhcp_bump because static.network has DHCP=yes. Disable manually via 'sudo systemctl disable esx_dhcp_bump' command if DHCP is not in use, then reboot the VA."  >> "$LOGFILE" 2>&1
+  fi
   outro
 fi
 
