@@ -28,10 +28,9 @@ ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # P
 LISTOFLOGS="/home/sailpoint/log/*.log"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
-FLATCAR_CURRENT_VER=''
 is_canal_enabled_bool=false # Assume canal disabled until proven otherwise
 CERT_DIRECTORY="/home/sailpoint/certificates"
-ADD_REBOOT_MESSAGE=false # Assume we don't require a reboot
+ADD_REBOOT_MESSAGE=false # Flip if reboot is required; makes a colorful message appear on stdout
 
 # colors for output
 GREEN='\033[0;32m'
@@ -74,7 +73,7 @@ help () {
   echo "o   Add openssl cert test"
   echo "f   Add automatic fixup steps"
   echo "l/L Add collection of log files and archive them along with stuntlog file."
-  echo "u   Only perform forced update (this will make system changes) then exit"
+  echo "u   Only perform forced OS update (this will make system changes) then exit"
   echo "c   Only perform a curl test that connects to SQS and S3, one test every four seconds for three minutes then exit"
   echo "r   Only reset your <id>.json file. ***Do not run this flag unless instructed to do so by support***"
 }
@@ -130,7 +129,7 @@ outro() {
 
 expect() {
   set -f
-  echo "********************************************************************************" >> "$LOGFILE"
+  echo "\n********************************************************************************" >> "$LOGFILE"
   echo "*** Expect $1" >> "$LOGFILE"
   echo "********************************************************************************" >> "$LOGFILE"
   set +f
@@ -141,6 +140,11 @@ endscript() {
   intro "$(date -u) - END TESTS for $ORGNAME on $PODNAME "
   echo >&2 "*** Tests completed on $(date -u) ***"
   echo "$DIVIDER"
+  if [ "$ADD_REBOOT_MESSAGE" == true ]; then
+    echo -e "$YELLOW$DIVIDER $REDBOLDUL"
+    echo -e "REBOOT IS REQUIRED; PLEASE RUN 'sudo reboot' NOW $RESETCOLOR"
+    echo -e "$YELLOW$DIVIDER $RESETCOLOR"
+  fi
 }
 
 get_keyPassphrase_length() {
@@ -309,7 +313,7 @@ cert_tester() {
   if [[ $failures > $starting_failures ]]; then
     echo "Failed or skipped certificates:"
     for cert_name in "${failed_certs[@]}"; do
-      echo "- $cert_name"
+      echo -e "Test -$RED FAIL$RESETCOLOR: $cert_name"
     done
   fi
 }
@@ -376,14 +380,14 @@ get_charon_network_test_line() {
 #CS0254079
 detect_old_os_version() {
   #look in $RUNNING_FLATCAR_VERSION for major version 2345 or lower
-  major_version=$( echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{ print $1}' )
+  major_version=$( echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{ print $1 }' )
   if [[ $major_version -le 2345 ]]; then
     echo "Major version is $major_version, and requires update."
     if [[ "$do_fixup" == true ]]; then
       update_old_os
-      echo 1
+      echo 0
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR OS is out of date, but the option for "
+      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup"
       echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file"
       echo 1
     fi
@@ -394,10 +398,11 @@ detect_old_os_version() {
 
 # CS0268451
 get_flatcar_current_version() {
-  if html=$(curl -s "$FLATCAR_RELEASES_URL" 2>/dev/null); then
-    FLATCAR_CURRENT_VER=$(echo "$html" | grep -oP '<span class="version">\K[^<]*' | head -n 1)
+  if flatcar_html=$(curl -s "$FLATCAR_RELEASES_URL" 2>/dev/null); then
+    FLATCAR_CURRENT_VER=$(echo "$flatcar_html" | grep -oP '<span class="version">\K[^<]*' | head -n 1)
+    echo $FLATCAR_CURRENT_VER
   else
-    echo "Error: unable to fetch HTML content from $url"
+    echo "Error: unable to fetch HTML content from $url" >> "$LOGFILE"
   fi
 }
 
@@ -436,12 +441,20 @@ outro
 # Do update
 if [ "$do_update" == "true" ]; then
   intro "Performing forced update - this process resets the machine-id and the update service. *REBOOTS ARE REQUIRED WHEN SUCCESSFUL*"
-  sudo rm -f /etc/machine-id  >> "$LOGFILE" 2>&1
-  sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
-  if [ echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{print $1}' -lt 3374 ]; then #CS0268437
-    sudo systemctl restart update-engine  >> "$LOGFILE" 2>&1
-  fi
-  sudo update_engine_client -reset_status && sudo update_engine_client -update >> "$LOGFILE" 2>&1
+  read -p "Do you need to perform a machine-id reset? Y/n: " response
+    case $response in 
+      [Yy])
+        sudo rm -f /etc/machine-id  >> "$LOGFILE" 2>&1
+        sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
+        ;;
+      *)
+        if [ echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{print $1}' -lt 3374 ]; then #CS0268437
+          sudo systemctl restart update-engine  >> "$LOGFILE" 2>&1
+        fi
+        sudo update_engine_client -reset_status && sudo update_engine_client -update >> "$LOGFILE" 2>&1
+        ADD_REBOOT_MESSAGE=true
+      ;;
+    esac
   # TODO - If this detects "NO_UPDATE_AVAILABLE", we should remove the machine id again, set it up again, and do the double-update (last line)
   # TODO - if this detects "UPDATE_STATUS_REPORTING_ERROR_EVENT", then do:
   # sudo journalctl --no-pager -u update-engine -e >> "$LOGFILE" 2>&1
@@ -587,26 +600,26 @@ expect "this to be /home/sailpoint/ but not a requirement"
 pwd >> "$LOGFILE"
 outro
 
+intro "Config.yaml tests"
 key_passphrase_length=$(get_keyPassphrase_length)
-expect "keyPassphrase length to be greater than 0 characters"
 perform_test "Is keyPassphrase length more than 0 characters?" "get_keyPassphrase_length" -gt 0 -lt 1 "configuration"
 outro
-expect "keyPassphrase length to be less than than 60 characters"
 perform_test "Is keyPassphrase length less than 60 characters?" "get_keyPassphrase_length" -lt 60 -gt 59 "configuration"
-outro
 echo -e "Current keyPassphrase length: $key_passphrase_length chars" >> "$LOGFILE"
 if [[ $key_passphrase_length -lt 1 ]]; then
   cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENECRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 else
   cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: ':::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 fi
-
-expect "a passing test against the IP $IPADDR. If public, VA is much less likely to be able to communicate with an internal DNS"
-perform_test "Is IP address ($IPADDR) private?" "is_ip_private_bool $IPADDR" -eq 0 -eq 1 "networking"
 outro
 
-expect "a passing test; string match uname command output for 'flatcar'"
-perform_test "Does Kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
+intro "This machine's IP address is: $IPADDR. If public, VA is much less likely to be able to communicate with an internal DNS"
+perform_test "Is IP address ($IPADDR) private?" "is_ip_private_bool $IPADDR" -eq 0 -eq 1 "networking"
+echo "IP Address: $IPADDR" >> "$LOGFILE"
+outro
+
+perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
+echo "uname output: $(uname -a)" >> "$LOGFILE"
 outro
 
 # CS0239311 
@@ -633,7 +646,6 @@ intro "Retrieving OpenJDK version from ccg"
 expect "this version of java to be 11.0.14 or higher and not 1.8.x"
 grep -a openjdk /home/sailpoint/log/worker.log | tail -1 >> "$LOGFILE"
 grep -a "openjdk version" /home/sailpoint/log/ccg-start.log | tail -1 >> "$LOGFILE"
-#TODO also look in ccg-start.log for "openjdk version "11.0.19" 2023-04-18" or "OpenJDK Runtime Environment (build 11.0.19+7-post-Ubuntu-0ubuntu120.04.1)"
 outro
 
 if test -f /etc/profile.env; then
@@ -660,7 +672,7 @@ if test -f /etc/systemd/network/static.network; then
   expect "individual DNS entries to be on separate lines beginning with 'DNS'."
   expect "the IP address to include CIDR notation."
   cat /etc/systemd/network/static.network >> "$LOGFILE"
-  if grep -q "DHCP=yes" /etc/systemd/network/static.network; then #check if static.network actually requests DHCP
+if grep -q "DHCP=yes" /etc/systemd/network/static.network; then #check if static.network actually requests DHCP
     static_network_file_dhcp_yes=true
   else
     static_network_file_dhcp_yes=false
@@ -680,9 +692,9 @@ if test -f /home/sailpoint/proxy.yaml; then
 fi
 
 expect "Version is the same as stable channel's most recent: https://www.flatcar.org/releases#stable-release"
-perform_test "Is current OS version the same as the one pulled from the Flatcar site?" "get_flatcar_current_version" "==" "$FLATCAR_CURRENT_VER" "!=" "$FLATCAR_CURRENT_VER" "system"
-echo "Current OS version on this system: $RUNNING_FLATCAR_VERSION" >> "$LOGFILE"
-echo "Current stable OS version on Flatcar site: $FLATCAR_CURRENT_VER" >> "$LOGFILE"
+perform_test "Is current OS version the same as the one pulled from the Flatcar site?" "get_flatcar_current_version" "==" "$RUNNING_FLATCAR_VERSION" "!=" "$RUNNING_FLATCAR_VERSION" "system"
+echo "OS version on this system: $RUNNING_FLATCAR_VERSION" >> "$LOGFILE"
+echo "Stable OS version on Flatcar site: $(get_flatcar_current_version)" >> "$LOGFILE"
 outro
 
 intro "Retrieving CPU information"
@@ -771,8 +783,12 @@ else
 fi
 
 intro "Retrieving contents of /home/sailpoint/hosts.yaml"
-expect "hosts.yaml information to be fed into /etc/hosts"
-cat /home/sailpoint/hosts.yaml >> "$LOGFILE"
+if [[ -e "/home/sailpoint/hosts.yaml" ]]; then
+  cat /home/sailpoint/hosts.yaml >> "$LOGFILE"
+else
+  echo "INFO - /home/sailpoint/hosts.yaml not found" >> "$LOGFILE"
+  echo -e "$CYAN INFO$RESETCOLOR - hosts.yaml not found"
+fi
 outro
 
 intro "Retrieving contents of /etc/hosts from host"
@@ -792,9 +808,9 @@ outro
 if [[ "$do_fixup" == true ]]; then
   intro "This step disables esx_dhcp_bump if needed"
   expect "any output stating this was removed/disabled. If there is, be sure to do a sudo reboot."
-  if [[ "$static_network_file_dhcp_yes" == false ]]; then
-    sudo systemctl disable esx_dhcp_bump >> "$LOGFILE" 2>&1
-  else
+if [[ "$static_network_file_dhcp_yes" == false ]]; then
+  sudo systemctl disable esx_dhcp_bump >> "$LOGFILE" 2>&1
+else
     echo "Not disabling esx_dhcp_bump because static.network has DHCP=yes. Disable manually via 'sudo systemctl disable esx_dhcp_bump' command if DHCP is not in use, then reboot the VA."  >> "$LOGFILE" 2>&1
   fi
   outro
@@ -822,39 +838,30 @@ expect "updated date for most certs to be today's date due to the script above (
 ls -alh /etc/ssl/certs >> "$LOGFILE" 2>&1
 outro
 
+#TODO: use ping to check if sites are resolving first, and if successful, then execute curl. The --connect-timeout option isn't working as anticipated.
 intro "External connectivity: Connection test for SQS (https://sqs.us-east-1.amazonaws.com)"
-expect "no self-signed certificates, and a verbose response, and a result of 404."
 curl -i -vv --connect-timeout 10 "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
-expect "a 404"
-perform_test "Curl test to SQS" "curl -i --connect-timeout 10 \"https://sqs.us-east-1.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout 10 \"https://sqs.us-east-1.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.identitynow.com"
-expect "a result of 302 - may fail to complete if this is a vanity org."
 curl -i --connect-timeout 10 "https://$ORGNAME.identitynow.com" >> "$LOGFILE" 2>&1
-expect "a 302"
-perform_test "Curl test to IdentityNow org" "curl -i \"https://$ORGNAME.identitynow.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i \"https://$ORGNAME.identitynow.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.api.identitynow.com"
-expect "a result of 404 - may fail to complete if this is a vanity org."
 curl -i --connect-timeout 10 "https://$ORGNAME.api.identitynow.com" >> "$LOGFILE" 2>&1
-expect "a 404"
-perform_test "Curl test to the tenant API" "curl -i --connect-timeout 10 \"https://$ORGNAME.api.identitynow.com\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout 10 \"https://$ORGNAME.api.identitynow.com\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$PODNAME.accessiq.sailpoint.com"
-expect "a result of 302"
 curl -i --connect-timeout 10 "https://$PODNAME.accessiq.sailpoint.com" >> "$LOGFILE" 2>&1
-expect "a 302"
-perform_test "Curl test to IdentityNow pod" "curl -i \"https://$PODNAME.accessiq.sailpoint.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to IdentityNow pod; expect a result of 302" "curl -i \"https://$PODNAME.accessiq.sailpoint.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.us-east-1.amazonaws.com)"
-expect "a result of 200"
 curl -i --connect-timeout 10 "https://dynamodb.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
-expect "a 200"
-perform_test "Curl test to DynamoDB" "curl -i \"https://dynamodb.us-east-1.amazonaws.com\" 2>&1 | grep \"HTTP/1.1 200 OK\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to DynamoDB; expect a result of 200" "curl -i \"https://dynamodb.us-east-1.amazonaws.com\" 2>&1 | grep \"HTTP/1.1 200 OK\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "Checking active ports using netstat."
@@ -891,7 +898,6 @@ if [[ "$gather_logs" != true ]]; then
   intro "Retrieving ccg.log errors - latest 30 errors"
   expect "recent datestamps. Some logs might be old and no longer pertinent. Expect no errors for keystore.jks which usually signifies a keyPassphrase issue."
   cat /home/sailpoint/log/ccg.log | grep stacktrace | tail -n30 >> "$LOGFILE" 2>&1
-  outro
 fi
 
 expect "the CCG image to be updated: it should be less than 3 weeks old."
