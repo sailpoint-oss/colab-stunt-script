@@ -28,7 +28,7 @@ ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # P
 LISTOFLOGS="/home/sailpoint/log/*.log"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
-is_canal_enabled_bool=false # Assume canal disabled until proven otherwise
+is_canal_enabled=false # Assume canal disabled until proven otherwise
 CERT_DIRECTORY="/home/sailpoint/certificates"
 ADD_REBOOT_MESSAGE=false # Flip if reboot is required; makes a colorful message appear on stdout
 
@@ -248,7 +248,7 @@ trap 'handle_error "$BASH_COMMAND"' ERR
 
 # CS0237900
 # Test if IP address is public, returns 0 if private, 1 if public.
-is_ip_private_bool() {
+is_ip_private() {
   local private_ranges=(
     "10.0.0.0/8"
     "172.16.0.0/12"
@@ -320,7 +320,7 @@ cert_tester() {
 }
 
 # Gives integer expression expected
-canalenv_exists_bool() {
+canalenv_exists() {
   if [[ -e /home/sailpoint/canal.env ]]; then
     echo 0
   else
@@ -351,7 +351,7 @@ canal_log_contains_FNF_string() {
   fi
 }
 
-canal-hc_log_exists_bool() {
+canal-hc_log_exists() {
   if [[ -e /home/sailpoint/log/canal-hc.log ]]; then
     echo 0
   else
@@ -366,7 +366,7 @@ canal-hc_log_exists_bool() {
   fi
 }
 
-ntp_sync_bool() {
+ntp_sync() {
   if timedatectl show --property=NTPSynchronized --value | grep -q '^yes$'; then
     echo 0
   else
@@ -405,6 +405,11 @@ get_flatcar_current_version() {
   else
     echo "Error: unable to fetch HTML content from $url" >> "$LOGFILE"
   fi
+}
+
+# CS0245929  
+no_proxy_double_quotes() {
+  
 }
 
 ### END FUNCTIONS ###
@@ -586,7 +591,7 @@ update_old_os() {
 
 # detect Canal in config.yaml
 if [[ $(cat /home/sailpoint/config.yaml | grep "tunnelTraffic: true" | wc -l) -gt 0 ]]; then
-  is_canal_enabled_bool=true
+  is_canal_enabled=true
   intro "NOTE: CANAL CONFIG DETECTED"
 fi
 
@@ -615,7 +620,7 @@ fi
 outro
 
 intro "This machine's IP address is: $IPADDR. If public, VA is much less likely to be able to communicate with an internal DNS"
-perform_test "Is IP address ($IPADDR) private?" "is_ip_private_bool $IPADDR" -eq 0 -eq 1 "networking"
+perform_test "Is IP address ($IPADDR) private?" "is_ip_private $IPADDR" -eq 0 -eq 1 "networking"
 echo "IP Address: $IPADDR" >> "$LOGFILE"
 outro
 
@@ -624,8 +629,8 @@ echo "uname output: $(uname -a)" >> "$LOGFILE"
 outro
 
 # CS0239311 
-ntp_result=$(ntp_sync_bool)
-perform_test "Does timedatectl show NTP time is synced?" "ntp_sync_bool" -eq 0 -ne 0 "configuration"
+ntp_result=$(ntp_sync)
+perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
   echo -e "     $YELLOW ACTION: $RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: "
   echo -e "     https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server"
@@ -686,9 +691,14 @@ expect "DNS entries to match those in static.network, if it exists."
 cat /etc/resolv.conf >> "$LOGFILE"
 outro
 
-if test -f /home/sailpoint/proxy.yaml; then
+proxy_file_path="/home/sailpoint/proxy.yaml"
+if test -f $proxy_file_path ; then
   intro "Retrieving the proxy config"
-  cat /home/sailpoint/proxy.yaml >> "$LOGFILE"
+  cat $proxy_file_path >> "$LOGFILE"
+
+  if [[ $(grep "no_proxy" $proxy_file_path | wc -l) -ge 1 ]]; then
+    perform_test "Is the value held in 'no_proxy' surrounded by double quotes?" "no_proxy_double_quotes" -ge 1 -le 0 "configuration"
+  fi
   outro
 fi
 
@@ -710,7 +720,7 @@ outro
 
 intro "Network list for all adapters"
 expect "one of two adapters to exist: ens160 or eth0. If canal is enabled, tun0 should be in this list as well."
-if [[ "$is_canal_enabled_bool" == true ]]; then
+if [[ "$is_canal_enabled" == true ]]; then
   expect "that tun0 exists and is routable."
 fi
 networkctl list >> "$LOGFILE"
@@ -725,7 +735,7 @@ else
 fi
 outro
 
-if [[ "$is_canal_enabled_bool" == true ]]; then
+if [[ "$is_canal_enabled" == true ]]; then
   expect "tun0 adapter to be in a 'routable (configuring)' state, and to show the online state as 'online'."
   networkctl status tun0 >> "$LOGFILE" 2>&1
 fi
@@ -914,7 +924,7 @@ perform_test "Is charon running?" "sudo docker ps | grep charon | wc -l" -eq 1 -
 outro
 perform_test "Is va (fluent) running?" "sudo docker ps | grep 'va:current' | wc -l" -eq 1 -lt 1 "system"
 outro
-if [[ "$is_canal_enabled_bool" == true ]]; then
+if [[ "$is_canal_enabled" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
   perform_test "Is canal running?" "sudo docker ps | grep canal | wc -l" -eq 1 -lt 1 "system"
   outro
@@ -950,7 +960,7 @@ expect "the file to exist, and contains a valid docker ECR address compared to t
 cat /etc/systemd/system/toolbox.service >> "$LOGFILE"
 outro
 
-if [[ "$is_canal_enabled_bool" == true ]]; then
+if [[ "$is_canal_enabled" == true ]]; then
   intro "Retrieving systemd service configuration file: canal"
   expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
   cat /etc/systemd/system/canal.service >> "$LOGFILE"
@@ -998,7 +1008,7 @@ expect "this to have fewer than 20 completed jobs. If lots of jobs are > 1 week 
 perform_test "Does /opt/sailpoint/share/jobs have fewer than 20 jobs?" "get_num_jobs" -lt 20 -gt 19 "system"
 outro
 
-if [[ "$is_canal_enabled_bool" == true ]]; then
+if [[ "$is_canal_enabled" == true ]]; then
   echo "$DIVIDER"
   intro "*** The following tests and data gathering are only run if Secure Tunnel config has been enabled"
   echo
@@ -1006,17 +1016,18 @@ if [[ "$is_canal_enabled_bool" == true ]]; then
   cat /opt/sailpoint/share/canal/client.conf >> "$LOGFILE"
   outro
 
-  expect "the canal.env file to exist if canal is configured"
-  perform_test "canal.env existence check" "canalenv_exists_bool" -eq 0 -eq 1 "system"
+  perform_test "The canal.env file should exist" "canalenv_exists" -eq 0 -eq 1 "system"
   outro
 
-  expect "the canal-hc.log file to exist if canal is configured"
-  perform_test "canal-hc.log existence check" "canal-hc_log_exists_bool" -eq 0 -eq 1 "system"
+  perform_test "The canal-hc.log file should exist" "canal-hc_log_exists" -eq 0 -eq 1 "system"
+  outro
+
+  perform_test "The canal-hc.log file should contain 0 instances of the error message " "canal_log_contains_FNF_string" -eq 0 -gt 0 "system"
   outro
 
   intro "Checking ccg.log for successful canal setup"
-  expect "this to contain something like 'Job SERVICE_SETUP fluent/ccg/relay/canal has FINISHED - result: SUCCESS'"
   perform_test "Check charon.log for canal setup success message" 'grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1' "==" "Job SERVICE_SETUP fluent/ccg/relay/canal has FINISHED - result: SUCCESS" "==" "" "configuration" 
+  grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1 >> "$LOGFILE"
   outro
 
   intro "Retrieving last 50 lines of canal service journal logs"
