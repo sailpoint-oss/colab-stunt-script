@@ -17,6 +17,7 @@ fi
 
 #constants
 CHARON_MINIMUM_VERSION="1647"
+ROOT_FS_MINIMUM_FREE_KB="1000000" #we want at least 1GB free
 
 ### GLOBAL VARIABLES ###
 VERSION="v2.1"
@@ -412,6 +413,20 @@ no_proxy_double_quotes() {
   
 }
 
+get_current_image_tag() {
+  image_name="$1"
+  current_image_id=$(sudo docker images | grep "$image_name" | grep current | head -n 1 | awk '{print $3}')
+  current_image_tag=$(sudo docker images | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}')
+  echo "$current_image_tag" | grep -o '^[[:digit:]]*'
+}
+
+clean_non_current_images() {
+  echo "Cleaning images, errors can be ignored"
+  current_images=$(sudo docker images | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
+  sudo docker images | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
+  echo "Cleaning is complete"
+}
+
 ### END FUNCTIONS ###
 
 
@@ -673,6 +688,8 @@ expect "proxy references in docker.env. Remove references to proxy if proxying i
 cat /home/sailpoint/docker.env >> "$LOGFILE"
 outro
 
+static_network_file_dhcp_yes=false #set default false as very few use dhcp=yes in static.network
+
 if test -f /etc/systemd/network/static.network; then
   intro "Retrieving the static.network file"
   expect "individual DNS entries to be on separate lines beginning with 'DNS'."
@@ -819,9 +836,9 @@ outro
 if [[ "$do_fixup" == true ]]; then
   intro "This step disables esx_dhcp_bump if needed"
   expect "any output stating this was removed/disabled. If there is, be sure to do a sudo reboot."
-if [[ "$static_network_file_dhcp_yes" == false ]]; then
-  sudo systemctl disable esx_dhcp_bump >> "$LOGFILE" 2>&1
-else
+  if [[ "$static_network_file_dhcp_yes" == false ]]; then
+    sudo systemctl disable esx_dhcp_bump >> "$LOGFILE" 2>&1
+  else
     echo "Not disabling esx_dhcp_bump because static.network has DHCP=yes. Disable manually via 'sudo systemctl disable esx_dhcp_bump' command if DHCP is not in use, then reboot the VA."  >> "$LOGFILE" 2>&1
   fi
   outro
@@ -911,6 +928,30 @@ if [[ "$gather_logs" != true ]]; then
   cat /home/sailpoint/log/ccg.log | grep stacktrace | tail -n30 >> "$LOGFILE" 2>&1
 fi
 
+intro "Checking Charon version"
+expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
+current_charon=$(get_current_image_Tag sailpoint/charon)
+echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
+
+if [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
+  echo "Current version of charon is too old." >> "$LOGFILE" 2>&1
+  if [ "$do_fixup" == true ]; then
+    echo "Restarting container to help update" | tee  -a "$LOGFILE" 
+    sudo systemctl restart va_agent 2>&1 | tee  -a "$LOGFILE" 
+    echo "VA Agent restart, waiting 30 seconds before restarting Charon" | tee  -a "$LOGFILE" 
+    sleep 30
+    sudo systemctl restart charon 2>&1 | tee  -a "$LOGFILE"
+    echo "Charon restarted. Please monitor its logs for connection or authentication errors" | tee  -a "$LOGFILE"
+    endscript
+    exit 0
+  else
+    echo "Charon container is running a older build that may fail to update."  >> "$LOGFILE" 2>&1
+    echo "Rerun this script with -f to automatically restart it."  >> "$LOGFILE" 2>&1
+    echo "Otherwise, run 'sudo systemctl restart charon' or reboot the entire VA".  >> "$LOGFILE" 2>&1
+  fi
+fi
+outro
+
 expect "the CCG image to be updated: it should be less than 3 weeks old."
 sudo docker images | sort >> "$LOGFILE"
 outro
@@ -983,6 +1024,22 @@ intro "Retrieving disk usage stats"
 expect "sda9/nvme0n1p9 to be less than 15% full. More likely means a debug setting was enabled long-term."
 df -h >> "$LOGFILE"
 outro
+
+intro "Checking if Root filesystem has at least $ROOT_FS_MINIMUM_FREE_KB kilobytes free"
+expect "Root filesystem should have at $ROOT_FS_MINIMUM_FREE_KB free"
+root_free_kb=$(df -k | grep " /$" | awk "{print $3}")
+echo "Root FS has $root_free_kb KB free" >> "$LOGFILE" 2>&1
+if [ "$root_free_kb" -lt "$ROOT_FS_MINIMIM_KB" ]; then
+  echo "Root FS has only $root_free_mb"  >> "$LOGFILE"
+  if [ "$do_fixup" == true ]; then
+    clean_non_current_images >> "$LOGFILE" 2>&1
+  else
+    echo "VA is low on disk space. Re-run this script with -f to clean unused container images to free space" >> "$LOGFILE" 2>&1
+    echo "You can also truncate the ccg logfile, but only do so if you do not need the data in it." >> "$LOGFILE" 2>&1
+    echo "To truncate the ccg log, run 'truncate -s 0 /home/sailpoint/log/ccg.log" >> "$LOGFILE" 2>&1
+  fi
+fi
+outro  
 
 intro "Retrieving disk usage paths"
 expect "most files to be less than 1GB. Log files can be significantly larger, but shouldn't exceed 1GB each."
