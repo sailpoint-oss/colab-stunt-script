@@ -29,9 +29,10 @@ ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # P
 LISTOFLOGS="/home/sailpoint/log/*.log"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
-is_canal_enabled=false # Assume canal disabled until proven otherwise
+IS_CANAL_ENABLED=false # Assume canal disabled until proven otherwise
 CERT_DIRECTORY="/home/sailpoint/certificates"
 ADD_REBOOT_MESSAGE=false # Flip if reboot is required; makes a colorful message appear on stdout
+PROXY_FILE_PATH="/home/sailpoint/proxy.yaml"
 
 # colors for output
 GREEN='\033[0;32m'
@@ -342,11 +343,11 @@ canal_log_contains_FNF_string() {
     echo 0
   else
     if [[ "$do_fixup" == true ]]; then
-      echo "Creating canal-hc.log"
-      touch /home/sailpoint/log/canal-hc.log
+      echo "Creating canal-hc.log" | tee -a "$LOGFILE"
+      touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR 'No such file or directory' error found in canal-hc.log,"
-      echo -e "but the option for automatic fixup is not enabled. Rerun STUNT with -f to create the canal-hc.log file"
+      echo -e "$YELLOW ACTION: $RESETCOLOR 'No such file or directory' error found in canal-hc.log," | tee -a "$LOGFILE"
+      echo -e "but the option for automatic fixup is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
     fi
     echo 1
   fi
@@ -357,11 +358,11 @@ canal-hc_log_exists() {
     echo 0
   else
     if [[ "$do_fixup" == true ]]; then
-      echo "Creating canal-hc.log"
-      touch /home/sailpoint/log/canal-hc.log
+      echo "Creating canal-hc.log" | tee -a "$LOGFILE"
+      touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup"
-      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file"
+      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
+      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
     fi
     echo 1
   fi
@@ -384,13 +385,15 @@ detect_old_os_version() {
   #look in $RUNNING_FLATCAR_VERSION for major version 2345 or lower
   major_version=$( echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{ print $1 }' )
   if [[ $major_version -le 2345 ]]; then
-    echo "Major version is $major_version, and requires update."
+    echo "Major version is $major_version, and requires update." | tee -a "$LOGFILE"
     if [[ "$do_fixup" == true ]]; then
+      echo -e "${CYAN}INFO$RESETCOLOR: Since -f flag was used, we'll attempt to update automatically." | tee -a "$LOGFILE"
+      echo | tee -a "$LOGFILE"
       update_old_os
       echo 0
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup"
-      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file"
+      echo -e "$YELLOW ACTION: $RESETCOLOR Old OS detected, but fixup flag is not enabled." | tee -a "$LOGFILE"
+      echo -e "Rerun STUNT with -f to attempt the automatic update process." | tee -a "$LOGFILE"
       echo 1
     fi
   else # major version greater than 2345
@@ -410,7 +413,13 @@ get_flatcar_current_version() {
 
 # CS0245929  
 no_proxy_double_quotes() {
-  
+  no_proxy_value=$(grep "^no_proxy:" "$PROXY_FILE_PATH" | awk -F': ' '{print $2}')
+
+  if [[ "$no_proxy_value" =~ ^\".*\"$ ]]; then
+    echo 0
+  else
+    echo 1
+  fi
 }
 
 get_current_image_tag() {
@@ -461,7 +470,7 @@ outro
 
 # Do update
 if [ "$do_update" == "true" ]; then
-  intro "Performing forced update - this process resets the machine-id and the update service. *REBOOTS ARE REQUIRED WHEN SUCCESSFUL*"
+  intro "Performing forced update - this process resets the machine-id and the update service. *A REBOOT IS REQUIRED WHEN SUCCESSFUL*"
   read -p "Do you need to perform a machine-id reset? Y/n: " response
     case $response in 
       [Yy])
@@ -469,13 +478,17 @@ if [ "$do_update" == "true" ]; then
         sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
         ;;
       *)
-        if [ echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{print $1}' -lt 3374 ]; then #CS0268437
-          sudo systemctl restart update-engine  >> "$LOGFILE" 2>&1
-        fi
-        sudo update_engine_client -reset_status && sudo update_engine_client -update >> "$LOGFILE" 2>&1
-        ADD_REBOOT_MESSAGE=true
       ;;
     esac
+
+  if [[ $(sudo -l | grep "systemctl restart update-engine" | wc -l) -gt 0 ]]; then
+    update_engine_result=$(sudo systemctl restart update-engine 2>&1)
+    echo "$update_engine_result" | tee -a "$LOGFILE"
+  fi
+  sudo update_engine_client -reset_status && sudo update_engine_client -update >> "$LOGFILE" 2>&1
+  if [[ $(grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" $LOGFILE  | wc -l) -gt 0 ]]; then
+    ADD_REBOOT_MESSAGE=true
+  fi
   # TODO - If this detects "NO_UPDATE_AVAILABLE", we should remove the machine id again, set it up again, and do the double-update (last line)
   # TODO - if this detects "UPDATE_STATUS_REPORTING_ERROR_EVENT", then do:
   # sudo journalctl --no-pager -u update-engine -e >> "$LOGFILE" 2>&1
@@ -497,22 +510,18 @@ if [ "$curl_test" == "true" ]; then
   while $runme; do
     if [ "$run_sqs" == true ]; then
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
-      echo "Testing connection to SQS: "
-      echo "Testing connection to SQS: " >> "$LOGFILE"
+      echo "Testing connection to SQS: " | tee -a "$LOGFILE"
       expect "a 404 error."
       curl -i --connect-timeout $seconds_between_tests "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE"
-      echo
-      echo >> "$LOGFILE"
+      echo | tee -a "$LOGFILE"
       run_sqs=false;
       sleep 4;
     else
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
-      echo "Testing connection to S3: "
-      echo "Testing connection to S3: " >> "$LOGFILE"
+      echo "Testing connection to S3: " | tee -a "$LOGFILE"
       expect "a 403 error."
       curl -i --connect-timeout $seconds_between_tests "https://sppcbu-va-images.s3.amazonaws.com" >> "$LOGFILE" 
-      echo
-      echo >> "$LOGFILE"
+      echo | tee -a "$LOGFILE"
       run_sqs=true;
       sleep 4;
     fi
@@ -544,8 +553,7 @@ if [[ "$reset_id_json" == "true" ]]; then
         sudo systemctl stop charon va_agent &&
         sudo rm -f $id_json_filepath/$id_json_filename
         if [ -f $id_json_filepath/$id_json_filename ]; then
-          echo "File still exists. Delete failed. Exiting" >> "$LOGFILE"
-          echo "File still exists. Delete failed. Exiting"
+          echo "File still exists. Delete failed. Exiting" | tee -a "$LOGFILE"
           exit 1
         else
           echo "File deleted successfully." >> "$LOGFILE"
@@ -564,8 +572,7 @@ if [[ "$reset_id_json" == "true" ]]; then
                 echo -ne "\r"
               done
               new_file=$(find "$id_json_filepath" -maxdepth 1 -type f -name "*.json")
-              echo "File generated @ $new_file!" >> "$LOGFILE"
-              echo "File generated @ $new_file!"
+              echo "File generated @ $new_file!" | tee -a "$LOGFILE"
               echo "Restarting services"
               sudo systemctl start charon >> "$LOGFILE" 
               sudo systemctl restart falcon >> "$LOGFILE" 
@@ -601,16 +608,18 @@ update_old_os() {
   sudo update-ca-certificates
   curl -sS https://stable.release.flatcar-linux.net/ >/dev/null
   sudo update_engine_client -update && echo "\nCompleted STUNT process." >> "$LOGFILE"
-  ADD_REBOOT_MESSAGE=true
+  if [[ $(grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" $LOGFILE | wc -l) -gt 0  ]]; then
+    ADD_REBOOT_MESSAGE=true
+  fi
 }
 
 # detect Canal in config.yaml
 if [[ $(cat /home/sailpoint/config.yaml | grep "tunnelTraffic: true" | wc -l) -gt 0 ]]; then
-  is_canal_enabled=true
+  IS_CANAL_ENABLED=true
   intro "NOTE: CANAL CONFIG DETECTED"
 fi
 
-# Execute tests
+### EXECUTE TESTS ### 
 
 intro "Retrieving list of files in home directory with ls -alh"
 ls -alh /home/sailpoint/ >> "$LOGFILE"
@@ -647,10 +656,8 @@ outro
 ntp_result=$(ntp_sync)
 perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
-  echo -e "     $YELLOW ACTION: $RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: "
-  echo -e "     https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server"
-  echo "ACTION: Test for NTP sync failed. To configure NTP, see the following link: " >> "$LOGFILE"
-  echo "https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server" >> "$LOGFILE"
+  echo -e "     $YELLOW ACTION: $RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
+  echo -e "     https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server" | tee -a "$LOGFILE"
 fi
 outro
 
@@ -708,12 +715,11 @@ expect "DNS entries to match those in static.network, if it exists."
 cat /etc/resolv.conf >> "$LOGFILE"
 outro
 
-proxy_file_path="/home/sailpoint/proxy.yaml"
-if test -f $proxy_file_path ; then
+if test -f $PROXY_FILE_PATH ; then
   intro "Retrieving the proxy config"
-  cat $proxy_file_path >> "$LOGFILE"
+  cat $PROXY_FILE_PATH >> "$LOGFILE"
 
-  if [[ $(grep "no_proxy" $proxy_file_path | wc -l) -ge 1 ]]; then
+  if [[ $(grep "no_proxy" $PROXY_FILE_PATH | wc -l) -ge 1 ]]; then
     perform_test "Is the value held in 'no_proxy' surrounded by double quotes?" "no_proxy_double_quotes" -ge 1 -le 0 "configuration"
   fi
   outro
@@ -724,6 +730,8 @@ perform_test "Is current OS version the same as the one pulled from the Flatcar 
 echo "OS version on this system: $RUNNING_FLATCAR_VERSION" >> "$LOGFILE"
 echo "Stable OS version on Flatcar site: $(get_flatcar_current_version)" >> "$LOGFILE"
 outro
+
+perform_test "The OS version must not be 2345.x.y." "detect_old_os_version" -eq 0 -eq 1 "system"
 
 intro "Retrieving CPU information"
 expect "the number of CPU(s) to be >= 2 CPUs. This is from AWS m4.large specs."
@@ -737,7 +745,7 @@ outro
 
 intro "Network list for all adapters"
 expect "one of two adapters to exist: ens160 or eth0. If canal is enabled, tun0 should be in this list as well."
-if [[ "$is_canal_enabled" == true ]]; then
+if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "that tun0 exists and is routable."
 fi
 networkctl list >> "$LOGFILE"
@@ -752,7 +760,7 @@ else
 fi
 outro
 
-if [[ "$is_canal_enabled" == true ]]; then
+if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "tun0 adapter to be in a 'routable (configuring)' state, and to show the online state as 'online'."
   networkctl status tun0 >> "$LOGFILE" 2>&1
 fi
@@ -767,8 +775,7 @@ intro "Testing direct connection to regional Secure Tunnel servers"
 expect "tests below to pass for every IP. On failure(s), ask if DPI (Deep Packet Inspection) or any variation is decrypting traffic from the VAs" 
 if [[ $PODNAME == *"useast1"* ||  $PODNAME == *"cook"* || $PODNAME == *"fiji"* || $PODNAME == *"uswest2"* || $PODNAME == *"cacentral1"* ]]; then
   # us-east-1 PODNAMEs contain: useast1 cook fiji uswest2 cacentral1
-  echo "Using us-east-1 endpoints: " >> "$LOGFILE"
-  echo "Using us-east-1 endpoints: "
+  echo "Using us-east-1 endpoints: " | tee -a "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 52.206.130.59" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.130.59 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
   outro
   perform_test "Canal Server Connection Test to IP: 52.206.133.183" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.133.183 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
@@ -777,8 +784,7 @@ if [[ $PODNAME == *"useast1"* ||  $PODNAME == *"cook"* || $PODNAME == *"fiji"* |
   outro
 elif [[ $PODNAME == *"eucentral1"* ]]; then
   # eu-central-1 PODNAMEs contain: eucentral1 
-  echo "Using eu-central-1 endpoints: " >> "$LOGFILE"
-  echo "Using eu-central-1 endpoints: "
+  echo "Using eu-central-1 endpoints: " | tee -a "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 35.157.132.22" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.132.22 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
   outro
   perform_test "Canal Server Connection Test to IP: 35.157.185.79" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.185.79 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
@@ -787,8 +793,7 @@ elif [[ $PODNAME == *"eucentral1"* ]]; then
   outro
 elif [[ $PODNAME == *"euwest2"* ]]; then
   #eu-west-2 PODNAMEs contain: euwest2
-  echo "Using eu-west-2 endpoints: " >> "$LOGFILE"
-  echo "Using eu-west-2 endpoints: "
+  echo "Using eu-west-2 endpoints: " | tee -a "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 18.130.210.174" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.210.174 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"  
   outro
   perform_test "Canal Server Connection Test to IP: 18.130.148.201" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.148.201 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
@@ -797,8 +802,7 @@ elif [[ $PODNAME == *"euwest2"* ]]; then
   outro
 elif [[ $PODNAME == *"apsoutheast2"* ]]; then
   #apac PODNAMEs contain: apsoutheast2
-  echo "Using ap-southeast-2 endpoints: " >> "$LOGFILE"
-  echo "Using ap-southeast-2 endpoints: "
+  echo "Using ap-southeast-2 endpoints: "| tee -a "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 52.65.42.92" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.65.42.92 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"  
   outro
   perform_test "Canal Server Connection Test to IP: 13.55.78.212" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 13.55.78.212 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
@@ -815,7 +819,7 @@ if [[ -e "/home/sailpoint/hosts.yaml" ]]; then
   cat /home/sailpoint/hosts.yaml >> "$LOGFILE"
 else
   echo "INFO - /home/sailpoint/hosts.yaml not found" >> "$LOGFILE"
-  echo -e "$CYAN INFO$RESETCOLOR - hosts.yaml not found"
+  echo -e "${CYAN}INFO$RESETCOLOR: hosts.yaml not found"
 fi
 outro
 
@@ -930,18 +934,18 @@ fi
 
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
-current_charon=$(get_current_image_Tag sailpoint/charon)
+current_charon=$(get_current_image_tag sailpoint/charon)
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
 if [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
   echo "Current version of charon is too old." >> "$LOGFILE" 2>&1
   if [ "$do_fixup" == true ]; then
-    echo "Restarting container to help update" | tee  -a "$LOGFILE" 
-    sudo systemctl restart va_agent 2>&1 | tee  -a "$LOGFILE" 
-    echo "VA Agent restart, waiting 30 seconds before restarting Charon" | tee  -a "$LOGFILE" 
+    echo "Restarting container to help update" | tee -a "$LOGFILE" 
+    sudo systemctl restart va_agent 2>&1 | tee -a "$LOGFILE" 
+    echo "VA Agent restart, waiting 30 seconds before restarting Charon" | tee -a "$LOGFILE" 
     sleep 30
-    sudo systemctl restart charon 2>&1 | tee  -a "$LOGFILE"
-    echo "Charon restarted. Please monitor its logs for connection or authentication errors" | tee  -a "$LOGFILE"
+    sudo systemctl restart charon 2>&1 | tee -a "$LOGFILE"
+    echo "Charon restarted. Please monitor its logs for connection or authentication errors" | tee -a "$LOGFILE"
     endscript
     exit 0
   else
@@ -965,7 +969,7 @@ perform_test "Is charon running?" "sudo docker ps | grep charon | wc -l" -eq 1 -
 outro
 perform_test "Is va (fluent) running?" "sudo docker ps | grep 'va:current' | wc -l" -eq 1 -lt 1 "system"
 outro
-if [[ "$is_canal_enabled" == true ]]; then
+if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
   perform_test "Is canal running?" "sudo docker ps | grep canal | wc -l" -eq 1 -lt 1 "system"
   outro
@@ -1001,7 +1005,7 @@ expect "the file to exist, and contains a valid docker ECR address compared to t
 cat /etc/systemd/system/toolbox.service >> "$LOGFILE"
 outro
 
-if [[ "$is_canal_enabled" == true ]]; then
+if [[ "$IS_CANAL_ENABLED" == true ]]; then
   intro "Retrieving systemd service configuration file: canal"
   expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
   cat /etc/systemd/system/canal.service >> "$LOGFILE"
@@ -1027,9 +1031,9 @@ outro
 
 intro "Checking if Root filesystem has at least $ROOT_FS_MINIMUM_FREE_KB kilobytes free"
 expect "Root filesystem should have at $ROOT_FS_MINIMUM_FREE_KB free"
-root_free_kb=$(df -k | grep " /$" | awk "{print $3}")
+root_free_kb=$(df -k | grep " /$" | awk '{print $4}')
 echo "Root FS has $root_free_kb KB free" >> "$LOGFILE" 2>&1
-if [ "$root_free_kb" -lt "$ROOT_FS_MINIMIM_KB" ]; then
+if [ "$root_free_kb" -lt "$ROOT_FS_MINIMUM_FREE_KB" ]; then
   echo "Root FS has only $root_free_mb"  >> "$LOGFILE"
   if [ "$do_fixup" == true ]; then
     clean_non_current_images >> "$LOGFILE" 2>&1
@@ -1065,7 +1069,7 @@ expect "this to have fewer than 20 completed jobs. If lots of jobs are > 1 week 
 perform_test "Does /opt/sailpoint/share/jobs have fewer than 20 jobs?" "get_num_jobs" -lt 20 -gt 19 "system"
 outro
 
-if [[ "$is_canal_enabled" == true ]]; then
+if [[ "$IS_CANAL_ENABLED" == true ]]; then
   echo "$DIVIDER"
   intro "*** The following tests and data gathering are only run if Secure Tunnel config has been enabled"
   echo
@@ -1129,8 +1133,7 @@ if [ "$gather_logs" = true ]; then
   echo "*** NOTE: This file might be large depending on the life of your VA. ***"
   echo
   zip -r $ZIPFILE $LOGFILE $LISTOFLOGS
-  echo "Zipped to $ZIPFILE"
-  echo "Zipped to $ZIPFILE" >> $LOGFILE
+  echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
   outro
 fi
 
