@@ -1,5 +1,68 @@
 #!/bin/bash
 
+#constants
+CHARON_MINIMUM_VERSION="1647"
+ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
+ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
+
+
+#### Pre-init Disk Check ####
+
+# Special case for when VA is totally out disk space and this
+# script is run via "curl | bash" because it can't be saved onto disk
+
+check_enough_free_disk() {
+  min_free_kb="$1"
+  min_free_kb="${min_free_kb:1000}" #default to 1 mb free minimum
+  root_free_kb=$(df -k | grep " /$" | awk '{print $4}')
+  echo "Root volume nas $root_free_kb kb free". 2>&1
+  if [ "$root_free_kb" -gt "$ROOT_FS_MINIMUM_FREE_KB_EMERGENCY" ]; then
+    echo "true"
+    return 0
+  else
+    echo "false"
+    return 1
+  fi
+}
+
+#check if we're being run interactively or not
+
+if [ -t 0 ]; then
+  echo "Welcome to SailPoint's VA Troubleshooting Script"
+else
+  echo "Welcome to SailPoint's VA Troubleshooting Script"
+  echo "Script might be executed from curl | bash because there is not enough free disk space"
+  # check free space
+
+  if check_enough_free_disk $ROOT_FS_MINIMUM_FREE_KB_EMERGENCY ; then
+    echo "This VA has at least $ROOT_FS_MINIMUM_FREE_KB_EMERGENCY kb root disk free"
+  else
+    echo "This VA is critically low on disk space. Attempting cleanup"
+    current_images=$(sudo docker images | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
+    sudo docker images | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
+    sudo rm -f /home/sailpoint/log/*.{0,1}  # delete rotated logs
+    sudo journalctl --no-pager --rotate
+    sudo journalctl --no-pager --vacuum-time=1d
+    # checking if that was enough space freed
+    if check_enough_free_disk $ROOT_FS_MINIMUM_FREE_KB_EMERGENCY; then
+      
+      echo "Freed suffient space to continue"
+    else
+      # still not enough, truncate logs
+      echo "Still not enough free space, truncating log files"
+      sudo chown -R sailpoint /home/sailpoint/log #make sure we own the files
+      echo "Stoping all containers to truncate logs. Will reboot after to restart containers"
+      sudo docker ps -q | xargs sudo docker stop
+      truncate -s 0 /home/sailpoint/log/fluent.log /home/sailpoint/log/ccg.log
+      sync
+      sleep 1
+      echo "Log files truncated. New free space is $(df -k | grep " /$" | awk '{print $4}')kb. Rebooting"
+      sleep 5 #giving time for user to read echo
+     # sudo reboot
+    fi
+  fi
+fi
+
 ### INIT ###
 if [[ -e "/home/sailpoint/config.yaml" ]]; then
   # Set global vars whose data come from config.yaml
@@ -14,10 +77,6 @@ else
   exit 1
 fi
 
-
-#constants
-CHARON_MINIMUM_VERSION="1647"
-ROOT_FS_MINIMUM_FREE_KB="1000000" #we want at least 1GB free
 
 ### GLOBAL VARIABLES ###
 VERSION="v2.1"
