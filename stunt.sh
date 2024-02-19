@@ -58,7 +58,7 @@ else
       sleep 1
       echo "Log files truncated. New free space is $(df -k | grep " /$" | awk '{print $4}')kb. Rebooting"
       sleep 5 #giving time for user to read echo
-     # sudo reboot
+      sudo reboot
     fi
   fi
 fi
@@ -571,7 +571,7 @@ if [ "$curl_test" == "true" ]; then
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
       echo "Testing connection to SQS: " | tee -a "$LOGFILE"
       expect "a 404 error."
-      curl -i --connect-timeout $seconds_between_tests "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE"
+      curl -Ssv -i --connect-timeout $seconds_between_tests "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE"
       echo | tee -a "$LOGFILE"
       run_sqs=false;
       sleep 4;
@@ -579,7 +579,7 @@ if [ "$curl_test" == "true" ]; then
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
       echo "Testing connection to S3: " | tee -a "$LOGFILE"
       expect "a 403 error."
-      curl -i --connect-timeout $seconds_between_tests "https://sppcbu-va-images.s3.amazonaws.com" >> "$LOGFILE" 
+      curl -Ssv -i --connect-timeout $seconds_between_tests "https://sppcbu-va-images.s3.amazonaws.com" >> "$LOGFILE" 
       echo | tee -a "$LOGFILE"
       run_sqs=true;
       sleep 4;
@@ -931,27 +931,27 @@ outro
 
 #TODO: use ping to check if sites are resolving first, and if successful, then execute curl. The --connect-timeout option isn't working as anticipated.
 intro "External connectivity: Connection test for SQS (https://sqs.us-east-1.amazonaws.com)"
-curl -i -vv --connect-timeout 10 "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
+curl -Ssv -i -vv --connect-timeout 10 "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
 perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout 10 \"https://sqs.us-east-1.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.identitynow.com"
-curl -i --connect-timeout 10 "https://$ORGNAME.identitynow.com" >> "$LOGFILE" 2>&1
+curl -Ssv -i --connect-timeout 10 "https://$ORGNAME.identitynow.com" >> "$LOGFILE" 2>&1
 perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i \"https://$ORGNAME.identitynow.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.api.identitynow.com"
-curl -i --connect-timeout 10 "https://$ORGNAME.api.identitynow.com" >> "$LOGFILE" 2>&1
+curl -Ssv -i --connect-timeout 10 "https://$ORGNAME.api.identitynow.com" >> "$LOGFILE" 2>&1
 perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout 10 \"https://$ORGNAME.api.identitynow.com\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$PODNAME.accessiq.sailpoint.com"
-curl -i --connect-timeout 10 "https://$PODNAME.accessiq.sailpoint.com" >> "$LOGFILE" 2>&1
+curl -Ssv -i --connect-timeout 10 "https://$PODNAME.accessiq.sailpoint.com" >> "$LOGFILE" 2>&1
 perform_test "Curl test to IdentityNow pod; expect a result of 302" "curl -i \"https://$PODNAME.accessiq.sailpoint.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.us-east-1.amazonaws.com)"
-curl -i --connect-timeout 10 "https://dynamodb.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
+curl -Ssv -i --connect-timeout 10 "https://dynamodb.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
 perform_test "Curl test to DynamoDB; expect a result of 200" "curl -i \"https://dynamodb.us-east-1.amazonaws.com\" 2>&1 | grep \"HTTP/1.1 200 OK\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
