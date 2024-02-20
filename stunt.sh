@@ -13,7 +13,10 @@ ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for th
 
 check_enough_free_disk() {
   min_free_kb="$1"
-  min_free_kb="${min_free_kb:1000}" #default to 1 mb free minimum
+  if [ -z "$min_free_kb" ]; then
+    echo "false"
+    return 1
+  fi
   root_free_kb=$(df -k | grep " /$" | awk '{print $4}')
   echo "Root volume nas $root_free_kb kb free". 2>&1
   if [ "$root_free_kb" -gt "$ROOT_FS_MINIMUM_FREE_KB_EMERGENCY" ]; then
