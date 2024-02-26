@@ -498,6 +498,31 @@ clean_non_current_images() {
   echo "Cleaning is complete"
 }
 
+fix_missing_images() {
+  if [ -f "/opt/sailpoint/share/ecs/ecs-auth.json" ]; then
+    ecr_creds=$(cat /opt/sailpoint/share/ecs/ecs-auth.json)
+    ecr_pw=$(jq -r '.pwd' < /opt/sailpoint/share/ecs/ecs-auth.json)
+    ecr_host=$(jq -r '.repo' < /opt/sailpoint/share/ecs/ecs-auth.json | sed 's|https://||' )
+    echo "$ecr_pw" | sudo docker login --username AWS --password-stdin ${ecr_host}/sailpoint/charon
+    sudo systemctl stop charon
+    sudo docker pull ${ecr_host}/sailpoint/charon && \
+      sudo docker tag ${ecr_host}/sailpoint/charon:latest ${ecr_host}/sailpoint/charon:current && \
+      sudo systemctl start charon && \
+      sleep 10
+    charon_status=$(systemctl list-units charon.service --no-pager --output json | jq -r '.[0].sub')
+    ADD_REBOOT_MESSAGE=true
+    if [ "$charon_status" = "running" ]; then
+      echo "Succesfully pulled updated Charon image" | tee -a "$LOGFILE"
+    else
+      echo "ERROR: Failed to pull and start latest Charon. Please contact Support" | tee -a "$LOGFILE"
+    fi
+    return 0
+
+  else
+    echo "ERROR: No ECR Creds on disk, can not attempt missing image repair. Please contact Support with this error." >> "$LOGFILE"
+  fi
+}
+
 ### END FUNCTIONS ###
 
 
@@ -999,7 +1024,7 @@ expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
 current_charon=$(get_current_image_tag sailpoint/charon)
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
-if [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
+if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
   echo "Current version of charon is too old." >> "$LOGFILE" 2>&1
   if [ "$do_fixup" == true ]; then
     echo "Restarting container to help update" | tee -a "$LOGFILE" 
@@ -1019,7 +1044,17 @@ fi
 outro
 
 expect "the CCG image to be updated: it should be less than 3 weeks old."
-sudo docker images | sort >> "$LOGFILE"
+docker_images=$(sudo docker images | sort)
+echo -e "$docker_images" >> "$LOGFILE"
+if echo -e "$docker_images" | grep -q "sailpoint/charon"; then
+  : # charon is present
+else
+  if [ "$do_fixup" == true ]; then
+    fix_missing_images >> "$LOGFILE" 2>&1
+  else
+    echo "Charon image is missing and fixup is disabled. Rerun script with fixup (-f) to attempt repair." | tee -a "$LOGFILE"
+  fi
+fi
 outro
 
 expect "the following four (4) processes to be running: ccg, va_agent, charon, and va."
