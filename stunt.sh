@@ -730,6 +730,10 @@ else
 fi
 outro
 
+intro "Retrieving list of sudo commands run from journalctl"
+sudo journalctl --no-pager _COMM=sudo  | grep -v -e "pam_unix(sudo:session)" >> "$LOGFILE"
+outro
+
 intro "This machine's IP address is: $IPADDR. If public, VA is much less likely to be able to communicate with an internal DNS"
 perform_test "Is IP address ($IPADDR) private?" "is_ip_private $IPADDR" -eq 0 -eq 1 "networking"
 echo "IP Address: $IPADDR" >> "$LOGFILE"
