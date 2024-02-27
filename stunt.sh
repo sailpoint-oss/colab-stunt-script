@@ -134,7 +134,6 @@ help () {
   echo "h   Print this help info then exit"
   echo "t   Add traceroute test to SQS"
   echo "p   Add ping test"
-  echo "o   Add openssl cert test"
   echo "f   Add automatic fixup steps"
   echo "l/L Add collection of log files and archive them along with stuntlog file."
   echo "u   Only perform forced OS update (this will make system changes) then exit"
@@ -143,7 +142,7 @@ help () {
 }
 
 # Get cmd line args
-while getopts ":htpuflLocer" option; do
+while getopts ":htpuflLcer" option; do
   case $option in
     h) #display help
       help
@@ -160,8 +159,6 @@ while getopts ":htpuflLocer" option; do
       gather_logs=true;;
     L)
       gather_logs=true;;
-    o)
-      check_openssl_cert=true;;
     c)
       curl_test=true;;
     r)
@@ -943,7 +940,7 @@ intro "Retrieving list of all SSL certs in $CERT_DIRECTORY"
 ls -alh $CERT_DIRECTORY >> "$LOGFILE" 2>&1
 outro
 
-if [[ "$check_openssl_cert" == true ]]; then
+if [[ $(ls -l /home/sailpoint/certificates | head -n1 | awk '{print $2}') -gt 0 ]]; then
   intro "Test all custom certificates in $CERT_DIRECTORY against openssl"
   cert_tester
   outro
@@ -1126,8 +1123,9 @@ lsblk -o NAME,SIZE,FSSIZE,FSAVAIL,FSUSE%,MOUNTPOINT,TYPE,RO >> "$LOGFILE"
 outro
 
 intro "Retrieving disk usage stats"
-expect "sda9/nvme0n1p9 to be less than 15% full. More likely means a debug setting was enabled long-term."
-df -h >> "$LOGFILE"
+expect "the root filesystem to be less than 15% full (typically sda9 or similar). Potential a debug setting was enabled long-term."
+expect "the filesystem types to be devtmpfs, tmpfs, vfat, overlay, or ext4, and NOT btrfs"
+df -Th >> "$LOGFILE"
 outro
 
 intro "Checking if Root filesystem has at least $ROOT_FS_MINIMUM_FREE_KB kilobytes free"
@@ -1157,7 +1155,7 @@ find /home/sailpoint/ -xdev -type f -size +100M -print | xargs ls -lh | sort -k5
 outro
 
 #TODO: Sometimes awk pattern /sda9|nvme0n1p9/ won't match. Need some error-checking on the local 'output' variable which stores the result of evaluating the 'test_command' variable.
-perform_test "Are more than 100 inodes available on the main partition at sda9 or nvme0n1p9?" '(df -i | awk "/sda9|nvme0n1p9/ {print \$4}" | tail -n1)' -gt 100 -lt 100 "system" 
+perform_test "Are more than 100 inodes available on the main partition?" '(df -i | awk "/sda9|nvme0n1p9/ {print \$4}" | tail -n1)' -gt 100 -lt 100 "system" 
 outro 
 
 intro "Retrieving number and list of pending jobs." 
