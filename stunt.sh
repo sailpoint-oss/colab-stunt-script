@@ -940,7 +940,7 @@ intro "Retrieving list of all SSL certs in $CERT_DIRECTORY"
 ls -alh $CERT_DIRECTORY >> "$LOGFILE" 2>&1
 outro
 
-if [[ $(ls -l /home/sailpoint/certificates | head -n1 | awk '{print $2}') -gt 0 ]]; then
+if [[ $( ls -1 /home/sailpoint/certificates | wc -l ) -gt 0 ]]; then
   intro "Test all custom certificates in $CERT_DIRECTORY against openssl"
   cert_tester
   outro
