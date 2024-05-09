@@ -48,7 +48,6 @@ else
     sudo journalctl --no-pager --vacuum-time=1d
     # checking if that was enough space freed
     if check_enough_free_disk $ROOT_FS_MINIMUM_FREE_KB_EMERGENCY; then
-
       echo "Freed suffient space to continue"
     else
       # still not enough, truncate logs
@@ -82,7 +81,7 @@ fi
 
 
 ### GLOBAL VARIABLES ###
-VERSION="v2.1"
+VERSION="v2.2"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}')
