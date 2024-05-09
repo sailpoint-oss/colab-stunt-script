@@ -143,7 +143,7 @@ help () {
 }
 
 # Get cmd line args
-while getopts ":htpuflLocer" option; do
+while getopts ":htpuflLjocer" option; do
   case $option in
     h) #display help
       help
