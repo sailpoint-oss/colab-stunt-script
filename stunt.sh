@@ -48,7 +48,7 @@ else
     sudo journalctl --no-pager --vacuum-time=1d
     # checking if that was enough space freed
     if check_enough_free_disk $ROOT_FS_MINIMUM_FREE_KB_EMERGENCY; then
-      
+
       echo "Freed suffient space to continue"
     else
       # still not enough, truncate logs
@@ -87,7 +87,7 @@ DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}')
 LOGFILE=/home/sailpoint/stuntlog-$ORGNAME-$IPADDR.txt
-ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip 
+ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
 LISTOFLOGS="/home/sailpoint/log/*.log"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
@@ -137,6 +137,7 @@ help () {
   echo "o   Add openssl cert test"
   echo "f   Add automatic fixup steps"
   echo "l/L Add collection of log files and archive them along with stuntlog file."
+  echo "j   Add collection of the last day of the systemd journal (requires -l/-L)"
   echo "u   Only perform forced OS update (this will make system changes) then exit"
   echo "c   Only perform a curl test that connects to SQS and S3, one test every four seconds for three minutes then exit"
   echo "r   Only reset your <id>.json file. ***Do not run this flag unless instructed to do so by support***"
@@ -166,7 +167,9 @@ while getopts ":htpuflLocer" option; do
       curl_test=true;;
     r)
       reset_id_json=true;;
-    \?) 
+    j)
+      capture_journal=true;;
+    \?)
       echo "Invalid argument on command line. Please review help below:"
       help
       exit;;
@@ -234,7 +237,7 @@ add_test_result() {
 }
 
 # CS0237804
-# example: 
+# example:
 # perform_test test_name test_command pass_comparison_operator pass_expected_condition fail_comparison_operator fail_expected_condition test_category
 # e.g.: perform_test "Does 1 = 1?" "if [[ 1 == 1 ]]; then echo true; fi" "==" "true" "==" "false" "<null>" "system"
 perform_test() {
@@ -245,7 +248,7 @@ perform_test() {
   local fail_comparison_operator="$5"
   local fail_expected_condition="$6"
   local test_category="$7"
-  
+
   output=$(eval "$test_command")
 
   if [ "$pass_comparison_operator" = "==" ] && [ "$output" = "$pass_expected_condition" ]; then
@@ -281,7 +284,7 @@ output_all_tests_by_category() {
     echo "Category: $category"
     tests="${test_categories[$category]}"
     IFS=',' read -ra test_results <<< "$tests"
-    
+
     for test_result in "${test_results[@]}"; do
       echo "  $test_result"
     done
@@ -439,7 +442,7 @@ ntp_sync() {
 }
 
 get_charon_network_test_line() {
-  grep -a 'Networking check' /home/sailpoint/log/charon.log | tail -1 
+  grep -a 'Networking check' /home/sailpoint/log/charon.log | tail -1
 }
 
 #CS0254079
@@ -473,7 +476,7 @@ get_flatcar_current_version() {
   fi
 }
 
-# CS0245929  
+# CS0245929
 no_proxy_double_quotes() {
   no_proxy_value=$(grep "^no_proxy:" "$PROXY_FILE_PATH" | awk -F': ' '{print $2}')
 
@@ -536,7 +539,7 @@ echo "*** performs recommended setup steps from the SailPoint VA documents which
 echo "*** when skipped will cause network connectivity problems, and creates a"
 echo "*** log file at '$LOGFILE'."
 echo "*** No warranty is expressed or implied for this tool by SailPoint."
-echo 
+echo
 
 
 if test -f "$LOGFILE"; then
@@ -559,7 +562,7 @@ outro
 if [ "$do_update" == "true" ]; then
   intro "Performing forced update - this process resets the machine-id and the update service. *A REBOOT IS REQUIRED WHEN SUCCESSFUL*"
   read -p "Do you need to perform a machine-id reset? Y/n: " response
-    case $response in 
+    case $response in
       [Yy])
         sudo rm -f /etc/machine-id  >> "$LOGFILE" 2>&1
         sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
@@ -607,7 +610,7 @@ if [ "$curl_test" == "true" ]; then
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
       echo "Testing connection to S3: " | tee -a "$LOGFILE"
       expect "a 403 error."
-      curl -Ssv -i --connect-timeout $seconds_between_tests "https://sppcbu-va-images.s3.amazonaws.com" >> "$LOGFILE" 
+      curl -Ssv -i --connect-timeout $seconds_between_tests "https://sppcbu-va-images.s3.amazonaws.com" >> "$LOGFILE"
       echo | tee -a "$LOGFILE"
       run_sqs=true;
       sleep 4;
@@ -621,7 +624,7 @@ if [ "$curl_test" == "true" ]; then
   endscript
   exit 0
 fi
-  
+
 # Reset <id>.json file - only use when moving a VA to a new cluster due to error "OpenSSL::PKey::RSAError: Neither PUB key nor PRIV key: bad decrypt" in charon.log
 if [[ "$reset_id_json" == "true" ]]; then
   intro "Resetting the <id>.json file at /opt/sailpoint/share/chef/data_bags/aws_credentials/"
@@ -661,11 +664,11 @@ if [[ "$reset_id_json" == "true" ]]; then
               new_file=$(find "$id_json_filepath" -maxdepth 1 -type f -name "*.json")
               echo "File generated @ $new_file!" | tee -a "$LOGFILE"
               echo "Restarting services"
-              sudo systemctl start charon >> "$LOGFILE" 
-              sudo systemctl restart falcon >> "$LOGFILE" 
-              sudo systemctl restart canal >> "$LOGFILE" 
-              sudo systemctl restart ccg >> "$LOGFILE" 
-              sudo systemctl restart otel_agent >> "$LOGFILE" 
+              sudo systemctl start charon >> "$LOGFILE"
+              sudo systemctl restart falcon >> "$LOGFILE"
+              sudo systemctl restart canal >> "$LOGFILE"
+              sudo systemctl restart ccg >> "$LOGFILE"
+              sudo systemctl restart otel_agent >> "$LOGFILE"
               ;;
             *)
               "Invalid input - exiting."
@@ -706,7 +709,7 @@ if [[ $(cat /home/sailpoint/config.yaml | grep "tunnelTraffic: true" | wc -l) -g
   intro "NOTE: CANAL CONFIG DETECTED"
 fi
 
-### EXECUTE TESTS ### 
+### EXECUTE TESTS ###
 
 intro "Retrieving list of files in home directory with ls -alh"
 ls -alh /home/sailpoint/ >> "$LOGFILE"
@@ -743,7 +746,7 @@ perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar
 echo "uname output: $(uname -a)" >> "$LOGFILE"
 outro
 
-# CS0239311 
+# CS0239311
 ntp_result=$(ntp_sync)
 perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
@@ -755,7 +758,7 @@ outro
 intro "Retrieving OS Uptime"
 expect "this VA to have been restarted recently if it is having issues."
 uptime >> "$LOGFILE"
-outro 
+outro
 
 intro "Retrieving environment variables"
 env >> "$LOGFILE"
@@ -863,42 +866,42 @@ get_charon_network_test_line >> "$LOGFILE"
 outro
 
 intro "Testing direct connection to regional Secure Tunnel servers"
-expect "tests below to pass for every IP. On failure(s), ask if DPI (Deep Packet Inspection) or any variation is decrypting traffic from the VAs" 
+expect "tests below to pass for every IP. On failure(s), ask if DPI (Deep Packet Inspection) or any variation is decrypting traffic from the VAs"
 if [[ $PODNAME == *"useast1"* ||  $PODNAME == *"cook"* || $PODNAME == *"fiji"* || $PODNAME == *"uswest2"* || $PODNAME == *"cacentral1"* ]]; then
   # us-east-1 PODNAMEs contain: useast1 cook fiji uswest2 cacentral1
   echo "Using us-east-1 endpoints: " | tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 52.206.130.59" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.130.59 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 52.206.130.59" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.130.59 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 52.206.133.183" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.133.183 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 52.206.133.183" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.133.183 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 52.206.132.240" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.132.240 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 52.206.132.240" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.132.240 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
 elif [[ $PODNAME == *"eucentral1"* ]]; then
-  # eu-central-1 PODNAMEs contain: eucentral1 
+  # eu-central-1 PODNAMEs contain: eucentral1
   echo "Using eu-central-1 endpoints: " | tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 35.157.132.22" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.132.22 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 35.157.132.22" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.132.22 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 35.157.185.79" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.185.79 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 35.157.185.79" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.185.79 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 35.157.251.228" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.251.228 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 35.157.251.228" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.251.228 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
 elif [[ $PODNAME == *"euwest2"* ]]; then
   #eu-west-2 PODNAMEs contain: euwest2
   echo "Using eu-west-2 endpoints: " | tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 18.130.210.174" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.210.174 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"  
+  perform_test "Canal Server Connection Test to IP: 18.130.210.174" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.210.174 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 18.130.148.201" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.148.201 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 18.130.148.201" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.148.201 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 35.178.220.78" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.178.220.78 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 35.178.220.78" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.178.220.78 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
 elif [[ $PODNAME == *"apsoutheast2"* ]]; then
   #apac PODNAMEs contain: apsoutheast2
   echo "Using ap-southeast-2 endpoints: "| tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 52.65.42.92" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.65.42.92 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"  
+  perform_test "Canal Server Connection Test to IP: 52.65.42.92" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.65.42.92 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 13.55.78.212" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 13.55.78.212 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 13.55.78.212" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 13.55.78.212 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 3.24.127.50" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 3.24.127.50 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking" 
+  perform_test "Canal Server Connection Test to IP: 3.24.127.50" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 3.24.127.50 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
   outro
 else
   echo "Unable to find appropriate canal server test with PODNAME: $PODNAME" >> "$LOGFILE"
@@ -989,7 +992,7 @@ outro
 
 intro "Checking active ports using netstat."
 sudo netstat -pan -A inet,inet6 | grep -v ESTABLISHED >> "$LOGFILE" 2>&1
-outro 
+outro
 
 intro "Display tcp statistics"
 expect "the number of failed connection attempts to be less than 100. If more, consider a packet capture."
@@ -1031,9 +1034,9 @@ echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
   echo "Current version of charon is too old." >> "$LOGFILE" 2>&1
   if [ "$do_fixup" == true ]; then
-    echo "Restarting container to help update" | tee -a "$LOGFILE" 
-    sudo systemctl restart va_agent 2>&1 | tee -a "$LOGFILE" 
-    echo "VA Agent restart, waiting 30 seconds before restarting Charon" | tee -a "$LOGFILE" 
+    echo "Restarting container to help update" | tee -a "$LOGFILE"
+    sudo systemctl restart va_agent 2>&1 | tee -a "$LOGFILE"
+    echo "VA Agent restart, waiting 30 seconds before restarting Charon" | tee -a "$LOGFILE"
     sleep 30
     sudo systemctl restart charon 2>&1 | tee -a "$LOGFILE"
     echo "Charon restarted. Please monitor its logs for connection or authentication errors" | tee -a "$LOGFILE"
@@ -1146,7 +1149,7 @@ if [ "$root_free_kb" -lt "$ROOT_FS_MINIMUM_FREE_KB" ]; then
     echo "To truncate the ccg log, run 'truncate -s 0 /home/sailpoint/log/ccg.log" >> "$LOGFILE" 2>&1
   fi
 fi
-outro  
+outro
 
 intro "Retrieving disk usage paths"
 expect "most files to be less than 1GB. Log files can be significantly larger, but shouldn't exceed 1GB each."
@@ -1159,10 +1162,10 @@ find /home/sailpoint/ -xdev -type f -size +100M -print | xargs ls -lh | sort -k5
 outro
 
 #TODO: Sometimes awk pattern /sda9|nvme0n1p9/ won't match. Need some error-checking on the local 'output' variable which stores the result of evaluating the 'test_command' variable.
-perform_test "Are more than 100 inodes available on the main partition at sda9 or nvme0n1p9?" '(df -i | awk "/sda9|nvme0n1p9/ {print \$4}" | tail -n1)' -gt 100 -lt 100 "system" 
-outro 
+perform_test "Are more than 100 inodes available on the main partition at sda9 or nvme0n1p9?" '(df -i | awk "/sda9|nvme0n1p9/ {print \$4}" | tail -n1)' -gt 100 -lt 100 "system"
+outro
 
-intro "Retrieving number and list of pending jobs." 
+intro "Retrieving number and list of pending jobs."
 num_pending_jobs=$(ls /opt/sailpoint/workflow/jobs/ | wc -l)
 echo "$num_pending_jobs pending jobs in the directory." >> "$LOGFILE"
 ls -al /opt/sailpoint/workflow/jobs >> "$LOGFILE"
@@ -1190,21 +1193,21 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
   outro
 
   intro "Checking ccg.log for successful canal setup"
-  perform_test "Check charon.log for canal setup success message" 'grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1' "==" "Job SERVICE_SETUP fluent/ccg/relay/canal has FINISHED - result: SUCCESS" "==" "" "configuration" 
+  perform_test "Check charon.log for canal setup success message" 'grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1' "==" "Job SERVICE_SETUP fluent/ccg/relay/canal has FINISHED - result: SUCCESS" "==" "" "configuration"
   grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1 >> "$LOGFILE"
   outro
 
   intro "Retrieving last 50 lines of canal service journal logs"
-  sudo journalctl --no-pager -n50 -u canal >> "$LOGFILE" 
+  sudo journalctl --no-pager -n50 -u canal >> "$LOGFILE"
   outro
 
   intro "Retrieving last 50 lines of update-service journal logs"
-  sudo journalctl --no-pager -n50 -u update-engine >> "$LOGFILE" 
+  sudo journalctl --no-pager -n50 -u update-engine >> "$LOGFILE"
   outro
-  
+
   echo "*** Completed gathering extra data from Canal config."
   echo "$DIVIDER"
-  echo 
+  echo
 fi
 
 intro "Retrieving last 50 lines of kernel journal logs"
@@ -1213,6 +1216,10 @@ outro
 
 intro "Retrieving last 50 lines of network journal logs"
 sudo journalctl --no-pager -n50 -u systemd-networkd >> "$LOGFILE"
+outro
+
+intro "Retrieving last 50 lines of logrotate journal logs"
+sudo journalctl --no-pager -n50 -u logrotate >> "$LOGFILE"
 outro
 
 intro "Retrieving last 50 lines of ccg journal logs"
@@ -1235,8 +1242,16 @@ if [ "$gather_logs" = true ]; then
   echo
   echo "*** NOTE: This file might be large depending on the life of your VA. ***"
   echo
-  zip -r $ZIPFILE $LOGFILE $LISTOFLOGS
-  echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
+  if [ "$capture_journal" = true]; then
+    echo "*** Gathering last day of systemd journal ***"
+    sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/journal-$(date +%Y%m%d%H%M).log
+  fi
+   zip -r $ZIPFILE $LOGFILE $LISTOFLOGS
+   echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
+  if [ "$capture_journal" = true]; then
+    echo "*** Removing temporary systemd journal log ***"
+    rm /home/sailpoint/journal-*.log
+  fi
   outro
 fi
 
@@ -1248,7 +1263,7 @@ echo $DIVIDER
 echo -e "Tests passed:                           $GREEN $passes $RESETCOLOR"
 echo -e "Tests failed:                           $RED $failures $RESETCOLOR"
 echo -e "Test warnings:                          $YELLOW $warnings $RESETCOLOR"
-echo 
+echo
 echo $DIVIDER
 
 summary="Testing summary \n
