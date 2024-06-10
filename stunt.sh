@@ -1087,7 +1087,9 @@ echo -e "$docker_images" >> "$LOGFILE"
 if echo -e "$docker_images" | grep -q "sailpoint/charon"; then
   : # charon is present
 else
+  echo "ERROR: Charon image is missing." | tee -a "$LOGFILE"
   if [ "$do_fixup" == true ]; then
+    echo "Attempting to fix missing images" | tee -a "$LOGFILE"
     fix_missing_images >> "$LOGFILE" 2>&1
   else
     echo "Charon image is missing and fixup is disabled. Rerun script with fixup (-f) to attempt repair." | tee -a "$LOGFILE"
