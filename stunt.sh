@@ -217,6 +217,9 @@ get_keyPassphrase_length() {
 get_num_share_jobs() {
   echo $(find "/opt/sailpoint/share/jobs" -maxdepth 1 -type f | wc -l)
 }
+get_num_workflow_jobs() {
+  echo $(find "/opt/sailpoint/workflow/jobs" -maxdepth 1 -type f | wc -l)
+}
 
 add_test_result() {
   local category="$1"
@@ -421,13 +424,6 @@ canal-hc_log_exists() {
   if [[ -e /home/sailpoint/log/canal-hc.log ]]; then
     echo 0
   else
-    if [[ "$do_fixup" == true ]]; then
-      echo "Creating canal-hc.log" | tee -a "$LOGFILE"
-      touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
-    else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
-      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
-    fi
     echo 1
   fi
 }
@@ -466,8 +462,8 @@ detect_old_os_version() {
 }
 
 # CS0268451
-get_flatcar_current_version() {
-  if flatcar_html=$(curl -s "$FLATCAR_RELEASES_URL" 2>/dev/null); then
+get_flatcar_current_version() { #"https://www.flatcar.org/releases"
+  if flatcar_html=$(curl -s $FLATCAR_RELEASES_URL 2>/dev/null); then
     FLATCAR_CURRENT_VER=$(echo "$flatcar_html" | grep -oP '<span class="version">\K[^<]*' | head -n 1)
     echo $FLATCAR_CURRENT_VER
   else
@@ -702,6 +698,20 @@ update_old_os() {
   fi
 }
 
+determine_hosting() {
+  host_return_string="undetermined. All attempts to gather metadata were unsuccessful."
+  # check if EC2
+  if curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/ > /dev/null; then
+    echo host_return_string="Amazon EC2"
+  elif curl -s -H "Metadata-Flavor: Google" --connect-timeout 2 http://169.254.169.254/ > /dev/null; then
+    echo host_return_string="Google Cloud"
+  elif curl -s -H Metadata:true --connect-timeout 2 "http://169.254.169.254/metadata/instance?api-version=2021-01-01" > /dev/null; then
+    echo host_return_string="Microsoft Azure"
+  else
+    echo $host_return_string
+  fi
+}
+
 # detect Canal in config.yaml
 if [[ $(cat /home/sailpoint/config.yaml | grep "tunnelTraffic: true" | wc -l) -gt 0 ]]; then
   IS_CANAL_ENABLED=true
@@ -719,17 +729,17 @@ expect "this to be /home/sailpoint/ but not a requirement"
 pwd >> "$LOGFILE"
 outro
 
+key_passphrase_length=$(get_keyPassphrase_length)
 intro "config.yaml contents"
 echo -e "Current keyPassphrase length: $key_passphrase_length chars" >> "$LOGFILE"
 if [[ $key_passphrase_length -lt 1 ]]; then
   cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENECRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 else
-  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: ':::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
+  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: '\?\"\?:::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 fi
 outro
 
 intro "config.yaml tests"
-key_passphrase_length=$(get_keyPassphrase_length)
 perform_test "Is keyPassphrase length more than 0 characters?" "get_keyPassphrase_length" -gt 0 -lt 1 "configuration"
 outro
 perform_test "Is keyPassphrase length less than 60 characters?" "get_keyPassphrase_length" -lt 60 -gt 59 "configuration"
@@ -772,9 +782,17 @@ outro
 
 intro "Retrieving OpenJDK version from ccg"
 expect "this version of java to be 11.0.14 or higher and not 1.8.x"
-echo "Grep in worker.log: $(grep -a openjdk /home/sailpoint/log/worker.log | tail -1)" >> "$LOGFILE"
-echo "Grep in ccg-start.log: $(grep -a "openjdk version" /home/sailpoint/log/ccg-start.log | tail -1)" >> "$LOGFILE"
-echo "Grep in ccg.log: $(grep -iE 'OpenJDK_64-Bit_Server_VM' /home/sailpoint/log/ccg.log | awk -F'OpenJDK_64-Bit_Server_VM' '{if (NF>1) {match($2, /[0-9]+\.[0-9]+\.[0-9]+/, version); if (version[0] != "") print version[0]}}' | tail -n1)" >> "$LOGFILE"
+if test -f /home/sailpoint/log/worker.log; then
+  echo "Grep in worker.log: $(grep -a openjdk /home/sailpoint/log/worker.log | tail -1)" >> "$LOGFILE"
+fi
+
+if test -f /home/sailpoint/log/ccg-start.log; then 
+  echo "Grep in ccg-start.log: $(grep -a "openjdk version" /home/sailpoint/log/ccg-start.log | tail -1)" >> "$LOGFILE"
+fi
+
+if test -f /home/sailpoint/log/ccg.log; then
+  echo "Grep in ccg.log: $(grep -iE 'OpenJDK_64-Bit_Server_VM' /home/sailpoint/log/ccg.log | awk -F'OpenJDK_64-Bit_Server_VM' '{if (NF>1) {match($2, /[0-9]+\.[0-9]+\.[0-9]+/, version); if (version[0] != "") print version[0]}}' | tail -n1)" >> "$LOGFILE"
+fi
 outro
 
 if test -f /etc/profile.env; then
@@ -828,7 +846,7 @@ fi
 
 expect "Version is the same as stable channel's most recent: https://www.flatcar.org/releases#stable-release"
 scraped_flatcar_version=$(get_flatcar_current_version)
-perform_test "Is current OS version the same as the one pulled from the Flatcar site?" "scraped_flatcar_version" "==" "$RUNNING_FLATCAR_VERSION" "!=" "$RUNNING_FLATCAR_VERSION" "system"
+perform_test "Is current OS version the same as the one pulled from the Flatcar site?" "get_flatcar_current_version" "==" "$RUNNING_FLATCAR_VERSION" "!=" "$RUNNING_FLATCAR_VERSION" "system"
 echo "OS version on this system: $RUNNING_FLATCAR_VERSION" >> "$LOGFILE"
 echo "Stable OS version on Flatcar site: $scraped_flatcar_version" >> "$LOGFILE"
 outro
@@ -1127,6 +1145,24 @@ expect "the file to exist, and contains the information about what Charon is try
 cat /opt/sailpoint/share/service-config.json >> "$LOGFILE"
 outro
 
+intro "Attempting to determine the hardware host of this VA"
+host_string=$(determine_hosting)
+echo "Hosting solution is $host_string" | tee -a "$LOGFILE"
+outro
+
+intro "If this system is hosted as a Hyper-V VM imported from the Azure VHD, disable waagent."
+if [[ $host_string == "Microsoft Azure" ]]; then
+  if [ "$do_fixup" == true ]; then
+    echo "Disabling waagent..."
+    sudo systemctl disable waagent | tee -a "$LOGFILE"
+  else
+    echo "System is probably hosted on MS Azure and fixup is disabled. Rerun script with fixup (-f) to attempt repair." | tee -a "$LOGFILE"
+  fi
+else
+  echo "Azure host not detected; no action required." | tee -a "$LOGFILE"
+fi
+outro
+
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   intro "Retrieving systemd service configuration file: canal"
   expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
@@ -1198,7 +1234,7 @@ outro
 
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   echo "$DIVIDER"
-  intro "*** The following tests and data gathering are only run if Secure Tunnel config has been enabled"
+  intro "The following tests and data gathering are only run if Secure Tunnel config has been enabled"
   echo
   intro "Retrieving the canal config file @/opt/sailpoint/share/canal/client.conf"
   cat /opt/sailpoint/share/canal/client.conf >> "$LOGFILE"
@@ -1208,6 +1244,16 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
   outro
 
   perform_test "The canal-hc.log file should exist" "canal-hc_log_exists" -eq 0 -eq 1 "system"
+  does_canal_hc_log_exist=$(canal-hc_log_exists)
+  if [[ "$does_canal_hc_log_exist" == 1 ]]; then
+    if [[ "$do_fixup" == true ]]; then
+      echo "Creating canal-hc.log" | tee -a "$LOGFILE"
+      touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
+    else
+      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
+      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
+    fi
+  fi
   outro
 
   perform_test "The canal-hc.log file should contain 0 instances of the error message 'No such file or directory'" "canal_log_contains_FNF_string" -eq 0 -gt 0 "system"
