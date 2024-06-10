@@ -88,6 +88,7 @@ IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0
 LOGFILE=/home/sailpoint/stuntlog-$ORGNAME-$IPADDR.txt
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
 LISTOFLOGS="/home/sailpoint/log/*.log"
+CCGDIR="/home/sailpoint/ccg/"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
 IS_CANAL_ENABLED=false # Assume canal disabled until proven otherwise
@@ -128,12 +129,11 @@ help () {
   echo "VA, and places that data into a stuntlog text file in your home directory."
   echo "Collecting this helps SailPoint Support Engineers troubleshoot your system."
   echo
-  echo "Syntax: ./stunt.sh [-h] [-t,p,o,f,l|L|u|c|r]"
+  echo "Syntax: ./stunt.sh [-h] [-t,p,o,f,l/L|u|c|r]"
   echo "Options:"
   echo "h   Print this help info then exit"
   echo "t   Add traceroute test to SQS"
   echo "p   Add ping test"
-  echo "o   Add openssl cert test"
   echo "f   Add automatic fixup steps"
   echo "l/L Add collection of log files and archive them along with stuntlog file."
   echo "j   Add collection of the last day of the systemd journal (requires -l/-L)"
@@ -160,8 +160,6 @@ while getopts ":htpuflLjocer" option; do
       gather_logs=true;;
     L)
       gather_logs=true;;
-    o)
-      check_openssl_cert=true;;
     c)
       curl_test=true;;
     r)
@@ -218,8 +216,11 @@ get_keyPassphrase_length() {
   cat /home/sailpoint/config.yaml | grep "::::" | sed "s/keyPassphrase: '//g" | sed "s/'$//gm" | wc -m # Will return 0 if unencrypted
 }
 
-get_num_jobs() {
+get_num_share_jobs() {
   echo $(find "/opt/sailpoint/share/jobs" -maxdepth 1 -type f | wc -l)
+}
+get_num_workflow_jobs() {
+  echo $(find "/opt/sailpoint/workflow/jobs" -maxdepth 1 -type f | wc -l)
 }
 
 add_test_result() {
@@ -250,6 +251,8 @@ perform_test() {
 
   output=$(eval "$test_command")
 
+  echo -e $DIVIDER
+
   if [ "$pass_comparison_operator" = "==" ] && [ "$output" = "$pass_expected_condition" ]; then
     echo -e "Test - PASS: $test_name" >> "$LOGFILE"
     echo -e "Test -$GREEN PASS$RESETCOLOR: $test_name"
@@ -276,6 +279,8 @@ perform_test() {
     ((warnings++))
     add_test_result "$test_category" "$test_name" "warn" "$output"
   fi
+
+  echo -e $DIVIDER
 }
 
 output_all_tests_by_category() {
@@ -312,8 +317,8 @@ handle_error() {
 trap handle_interrupts SIGINT
 trap 'handle_error "$BASH_COMMAND"' ERR
 
-# CS0237900
-# Test if IP address is public, returns 0 if private, 1 if public.
+
+#CS0237900
 is_ip_private() {
   local private_ranges=(
     "10.0.0.0/8"
@@ -322,18 +327,18 @@ is_ip_private() {
   )
 
   IFS='.' read -r -a ip_parts <<< "$IPADDR"
-  local ip_number=$(( (${ip_parts[0]} << 24) + (${ip_parts[1]} << 16) + (${ip_parts[2]} << 8) + ${ip_parts[3]} ))
+  local ip_number=$(( (${ip_parts[0]} * 256**3) + (${ip_parts[1]} * 256**2) + (${ip_parts[2]} * 256) + ${ip_parts[3]} )) 
 
   for range in "${private_ranges[@]}"; do
     IFS='/' read -r -a range_parts <<< "$range"
     local network_address="${range_parts[0]}"
     local subnet_mask="${range_parts[1]}"
 
-    IFS='.' read -r -a range_parts <<< "$network_address"
-    local range_number=$(( (${range_parts[0]} << 24) + (${range_parts[1]} << 16) + (${range_parts[2]} << 8) + ${range_parts[3]} ))
-    local mask=$(( 0xFFFFFFFF << (32 - $subnet_mask) ))
+    IFS='.' read -r -a network_parts <<< "$network_address"
+    local range_number=$(( (${network_parts[0]} * 256**3) + (${network_parts[1]} * 256**2) + (${network_parts[2]} * 256) + ${network_parts[3]} ))
+    local mask=$((0xFFFFFFFF * (2 ** (32 - subnet_mask)) ))
 
-    if (( ($ip_number & $mask) == ($range_number & $mask) )); then
+    if (( (ip_number & mask) == (range_number & mask) )); then
       echo 0
       return
     fi
@@ -421,13 +426,6 @@ canal-hc_log_exists() {
   if [[ -e /home/sailpoint/log/canal-hc.log ]]; then
     echo 0
   else
-    if [[ "$do_fixup" == true ]]; then
-      echo "Creating canal-hc.log" | tee -a "$LOGFILE"
-      touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
-    else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
-      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
-    fi
     echo 1
   fi
 }
@@ -466,12 +464,12 @@ detect_old_os_version() {
 }
 
 # CS0268451
-get_flatcar_current_version() {
-  if flatcar_html=$(curl -s "$FLATCAR_RELEASES_URL" 2>/dev/null); then
+get_flatcar_current_version() { #"https://www.flatcar.org/releases"
+  if flatcar_html=$(curl -s $FLATCAR_RELEASES_URL 2>/dev/null); then
     FLATCAR_CURRENT_VER=$(echo "$flatcar_html" | grep -oP '<span class="version">\K[^<]*' | head -n 1)
     echo $FLATCAR_CURRENT_VER
   else
-    echo "Error: unable to fetch HTML content from $url" >> "$LOGFILE"
+    echo "Error: unable to fetch HTML content from $FLATCAR_RELEASES_URL" >> "$LOGFILE"
   fi
 }
 
@@ -663,11 +661,11 @@ if [[ "$reset_id_json" == "true" ]]; then
               new_file=$(find "$id_json_filepath" -maxdepth 1 -type f -name "*.json")
               echo "File generated @ $new_file!" | tee -a "$LOGFILE"
               echo "Restarting services"
-              sudo systemctl start charon >> "$LOGFILE"
-              sudo systemctl restart falcon >> "$LOGFILE"
-              sudo systemctl restart canal >> "$LOGFILE"
-              sudo systemctl restart ccg >> "$LOGFILE"
-              sudo systemctl restart otel_agent >> "$LOGFILE"
+              sudo systemctl start charon 2>&1 | tee -a "$LOGFILE" || echo "Failed to start charon" | tee -a "$LOGFILE"
+              sudo systemctl restart falcon >> "$LOGFILE" 2>&1 || echo "Failed to restart falcon" >> "$LOGFILE"
+              sudo systemctl restart canal >> "$LOGFILE" 2>&1 || echo "Failed to restart canal" >> "$LOGFILE"
+              sudo systemctl restart ccg >> "$LOGFILE" 2>&1 || echo "Failed to restart ccg" >> "$LOGFILE"
+              sudo systemctl restart otel_agent >> "$LOGFILE" 2>&1 || echo "Failed to restart otel_agent" >> "$LOGFILE"
               ;;
             *)
               "Invalid input - exiting."
@@ -702,6 +700,20 @@ update_old_os() {
   fi
 }
 
+determine_hosting() {
+  host_return_string="undetermined. All attempts to gather metadata were unsuccessful."
+  # check if EC2
+  if curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/ > /dev/null; then
+    echo host_return_string="Amazon EC2"
+  elif curl -s -H "Metadata-Flavor: Google" --connect-timeout 2 http://169.254.169.254/ > /dev/null; then
+    echo host_return_string="Google Cloud"
+  elif curl -s -H Metadata:true --connect-timeout 2 "http://169.254.169.254/metadata/instance?api-version=2021-01-01" > /dev/null; then
+    echo host_return_string="Microsoft Azure"
+  else
+    echo $host_return_string
+  fi
+}
+
 # detect Canal in config.yaml
 if [[ $(cat /home/sailpoint/config.yaml | grep "tunnelTraffic: true" | wc -l) -gt 0 ]]; then
   IS_CANAL_ENABLED=true
@@ -719,17 +731,24 @@ expect "this to be /home/sailpoint/ but not a requirement"
 pwd >> "$LOGFILE"
 outro
 
-intro "Config.yaml tests"
 key_passphrase_length=$(get_keyPassphrase_length)
-perform_test "Is keyPassphrase length more than 0 characters?" "get_keyPassphrase_length" -gt 0 -lt 1 "configuration"
-outro
-perform_test "Is keyPassphrase length less than 60 characters?" "get_keyPassphrase_length" -lt 60 -gt 59 "configuration"
+intro "config.yaml contents"
 echo -e "Current keyPassphrase length: $key_passphrase_length chars" >> "$LOGFILE"
 if [[ $key_passphrase_length -lt 1 ]]; then
   cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENECRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 else
-  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: ':::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
+  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: '\?\"\?:::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 fi
+outro
+
+intro "config.yaml tests"
+perform_test "Is keyPassphrase length more than 0 characters?" "get_keyPassphrase_length" -gt 0 -lt 1 "configuration"
+outro
+perform_test "Is keyPassphrase length less than 60 characters?" "get_keyPassphrase_length" -lt 60 -gt 59 "configuration"
+outro 
+
+intro "Retrieving history of commands run on this session"
+history >> "$LOGFILE"
 outro
 
 intro "Retrieving list of sudo commands run from journalctl"
@@ -745,7 +764,7 @@ perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar
 echo "uname output: $(uname -a)" >> "$LOGFILE"
 outro
 
-# CS0239311
+# CS0239311 - If left unsynced, could result in excessive message processing times
 ntp_result=$(ntp_sync)
 perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
@@ -765,8 +784,17 @@ outro
 
 intro "Retrieving OpenJDK version from ccg"
 expect "this version of java to be 11.0.14 or higher and not 1.8.x"
-grep -a openjdk /home/sailpoint/log/worker.log | tail -1 >> "$LOGFILE"
-grep -a "openjdk version" /home/sailpoint/log/ccg-start.log | tail -1 >> "$LOGFILE"
+if test -f /home/sailpoint/log/worker.log; then
+  echo "Grep in worker.log: $(grep -a openjdk /home/sailpoint/log/worker.log | tail -1)" >> "$LOGFILE"
+fi
+
+if test -f /home/sailpoint/log/ccg-start.log; then 
+  echo "Grep in ccg-start.log: $(grep -a "openjdk version" /home/sailpoint/log/ccg-start.log | tail -1)" >> "$LOGFILE"
+fi
+
+if test -f /home/sailpoint/log/ccg.log; then
+  echo "Grep in ccg.log: $(grep -iE 'OpenJDK_64-Bit_Server_VM' /home/sailpoint/log/ccg.log | awk -F'OpenJDK_64-Bit_Server_VM' '{if (NF>1) {match($2, /[0-9]+\.[0-9]+\.[0-9]+/, version); if (version[0] != "") print version[0]}}' | tail -n1)" >> "$LOGFILE"
+fi
 outro
 
 if test -f /etc/profile.env; then
@@ -819,9 +847,10 @@ if test -f $PROXY_FILE_PATH ; then
 fi
 
 expect "Version is the same as stable channel's most recent: https://www.flatcar.org/releases#stable-release"
+scraped_flatcar_version=$(get_flatcar_current_version)
 perform_test "Is current OS version the same as the one pulled from the Flatcar site?" "get_flatcar_current_version" "==" "$RUNNING_FLATCAR_VERSION" "!=" "$RUNNING_FLATCAR_VERSION" "system"
 echo "OS version on this system: $RUNNING_FLATCAR_VERSION" >> "$LOGFILE"
-echo "Stable OS version on Flatcar site: $(get_flatcar_current_version)" >> "$LOGFILE"
+echo "Stable OS version on Flatcar site: $scraped_flatcar_version" >> "$LOGFILE"
 outro
 
 perform_test "The OS version must not be 2345.x.y." "detect_old_os_version" -eq 0 -eq 1 "system"
@@ -927,7 +956,7 @@ outro
 
 intro "Retrieving contents of /opt/sailpoint/ccg/lib/custom from ccg container"
 expect "JDBC driver jar files. Make sure they are populating here if required."
-sudo docker exec ccg ls -l /opt/sailpoint/ccg/lib/custom >> "$LOGFILE" 2>&1
+sudo docker exec ccg ls -al /opt/sailpoint/ccg/lib/custom >> "$LOGFILE" 2>&1
 outro
 
 if [[ "$do_fixup" == true ]]; then
@@ -945,7 +974,7 @@ intro "Retrieving list of all SSL certs in $CERT_DIRECTORY"
 ls -alh $CERT_DIRECTORY >> "$LOGFILE" 2>&1
 outro
 
-if [[ "$check_openssl_cert" == true ]]; then
+if [[ $( ls -1 /home/sailpoint/certificates | wc -l ) -gt 0 ]]; then
   intro "Test all custom certificates in $CERT_DIRECTORY against openssl"
   cert_tester
   outro
@@ -966,26 +995,31 @@ outro
 #TODO: use ping to check if sites are resolving first, and if successful, then execute curl. The --connect-timeout option isn't working as anticipated.
 intro "External connectivity: Connection test for SQS (https://sqs.us-east-1.amazonaws.com)"
 curl -Ssv -i -vv --connect-timeout 10 "https://sqs.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
+outro
 perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout 10 \"https://sqs.us-east-1.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.identitynow.com"
 curl -Ssv -i --connect-timeout 10 "https://$ORGNAME.identitynow.com" >> "$LOGFILE" 2>&1
-perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i \"https://$ORGNAME.identitynow.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
+outro
+perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i \"https://$ORGNAME.identitynow.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking" # TODO: add HTTP/1.1 302 Found"
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.api.identitynow.com"
 curl -Ssv -i --connect-timeout 10 "https://$ORGNAME.api.identitynow.com" >> "$LOGFILE" 2>&1
+outro
 perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout 10 \"https://$ORGNAME.api.identitynow.com\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 intro "External connectivity: Connection test for https://$PODNAME.accessiq.sailpoint.com"
 curl -Ssv -i --connect-timeout 10 "https://$PODNAME.accessiq.sailpoint.com" >> "$LOGFILE" 2>&1
-perform_test "Curl test to IdentityNow pod; expect a result of 302" "curl -i \"https://$PODNAME.accessiq.sailpoint.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking"
+outro
+perform_test "Curl test to IdentityNow pod; expect a result of 302" "curl -i \"https://$PODNAME.accessiq.sailpoint.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking" # TODO: add HTTP/1.1 302 Found"
 outro
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.us-east-1.amazonaws.com)"
 curl -Ssv -i --connect-timeout 10 "https://dynamodb.us-east-1.amazonaws.com" >> "$LOGFILE" 2>&1
+outro
 perform_test "Curl test to DynamoDB; expect a result of 200" "curl -i \"https://dynamodb.us-east-1.amazonaws.com\" 2>&1 | grep \"HTTP/1.1 200 OK\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
@@ -1110,6 +1144,29 @@ expect "the file to exist, and contains a valid docker ECR address compared to t
 cat /etc/systemd/system/toolbox.service >> "$LOGFILE"
 outro
 
+intro "Retrieving the service-config file"
+expect "the file to exist, and contains the information about what Charon is trying to download."
+cat /opt/sailpoint/share/service-config.json >> "$LOGFILE"
+outro
+
+intro "Attempting to determine the hardware host of this VA"
+host_string=$(determine_hosting)
+echo "Hosting solution is $host_string" | tee -a "$LOGFILE"
+outro
+
+intro "If this system is hosted as a Hyper-V VM imported from the Azure VHD, disable waagent."
+if [[ $host_string == "Microsoft Azure" ]]; then
+  if [ "$do_fixup" == true ]; then
+    echo "Disabling waagent..."
+    sudo systemctl disable waagent | tee -a "$LOGFILE"
+  else
+    echo "System is probably hosted on MS Azure and fixup is disabled. Rerun script with fixup (-f) to attempt repair." | tee -a "$LOGFILE"
+  fi
+else
+  echo "Azure host not detected; no action required." | tee -a "$LOGFILE"
+fi
+outro
+
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   intro "Retrieving systemd service configuration file: canal"
   expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
@@ -1126,12 +1183,13 @@ fi
 intro "Retrieving partition table info"
 expect "total disk space under \"SIZE\". Should be ~128GB or more."
 expect "one sda<#> to be TYPE 'part' and RO '0'. This means the PARTition is writable."
-lsblk -o NAME,SIZE,FSSIZE,FSAVAIL,FSUSE%,MOUNTPOINT,TYPE,RO >> "$LOGFILE"
+lsblk -o NAME,SIZE,FSTYPE,FSSIZE,FSAVAIL,FSUSE%,MOUNTPOINT,TYPE,RO >> "$LOGFILE"
 outro
 
 intro "Retrieving disk usage stats"
-expect "sda9/nvme0n1p9 to be less than 15% full. More likely means a debug setting was enabled long-term."
-df -h >> "$LOGFILE"
+expect "the root filesystem to be less than 15% full (typically sda9 or similar). Potential a debug setting was enabled long-term."
+expect "the filesystem types to be devtmpfs, tmpfs, vfat, overlay, or ext4, and NOT btrfs"
+df -Th >> "$LOGFILE"
 outro
 
 intro "Checking if Root filesystem has at least $ROOT_FS_MINIMUM_FREE_KB kilobytes free"
@@ -1161,8 +1219,8 @@ find /home/sailpoint/ -xdev -type f -size +100M -print | xargs ls -lh | sort -k5
 outro
 
 #TODO: Sometimes awk pattern /sda9|nvme0n1p9/ won't match. Need some error-checking on the local 'output' variable which stores the result of evaluating the 'test_command' variable.
-perform_test "Are more than 100 inodes available on the main partition at sda9 or nvme0n1p9?" '(df -i | awk "/sda9|nvme0n1p9/ {print \$4}" | tail -n1)' -gt 100 -lt 100 "system"
-outro
+perform_test "Are more than 100 inodes available on the main partition?" '(df -i | awk "/sda9|nvme0n1p9/ {print \$4}" | tail -n1)' -gt 100 -lt 100 "system" 
+outro 
 
 intro "Retrieving number and list of pending jobs."
 num_pending_jobs=$(ls /opt/sailpoint/workflow/jobs/ | wc -l)
@@ -1171,12 +1229,16 @@ ls -al /opt/sailpoint/workflow/jobs >> "$LOGFILE"
 outro
 
 expect "this to have fewer than 20 completed jobs. If lots of jobs are > 1 week old, run: sudo rm -rf /opt/sailpoint/share/jobs/* && sudo reboot"
-perform_test "Does /opt/sailpoint/share/jobs have fewer than 20 jobs?" "get_num_jobs" -lt 20 -gt 19 "system"
+perform_test "Does /opt/sailpoint/share/jobs have fewer than 20 jobs?" "get_num_share_jobs" -lt 20 -gt 19 "system"
+outro
+
+expect "this to have fewer than 20 workflow jobs. If lots of jobs are > 1 week old, run: sudo rm -rf /opt/sailpoint/workflow/jobs/* && sudo reboot"
+perform_test "Does /opt/sailpoint/workflow/jobs have fewer than 20 jobs?" "get_num_workflow_jobs" -lt 20 -gt 19 "system"
 outro
 
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   echo "$DIVIDER"
-  intro "*** The following tests and data gathering are only run if Secure Tunnel config has been enabled"
+  intro "The following tests and data gathering are only run if Secure Tunnel config has been enabled"
   echo
   intro "Retrieving the canal config file @/opt/sailpoint/share/canal/client.conf"
   cat /opt/sailpoint/share/canal/client.conf >> "$LOGFILE"
@@ -1186,13 +1248,24 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
   outro
 
   perform_test "The canal-hc.log file should exist" "canal-hc_log_exists" -eq 0 -eq 1 "system"
+  does_canal_hc_log_exist=$(canal-hc_log_exists)
+  if [[ "$does_canal_hc_log_exist" == 1 ]]; then
+    if [[ "$do_fixup" == true ]]; then
+      echo "Creating canal-hc.log" | tee -a "$LOGFILE"
+      touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
+    else
+      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
+      echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
+    fi
+  fi
   outro
 
-  perform_test "The canal-hc.log file should contain 0 instances of the error message " "canal_log_contains_FNF_string" -eq 0 -gt 0 "system"
+  perform_test "The canal-hc.log file should contain 0 instances of the error message 'No such file or directory'" "canal_log_contains_FNF_string" -eq 0 -gt 0 "system"
   outro
 
-  intro "Checking ccg.log for successful canal setup"
-  perform_test "Check charon.log for canal setup success message" 'grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1' "==" "Job SERVICE_SETUP fluent/ccg/relay/canal has FINISHED - result: SUCCESS" "==" "" "configuration"
+  intro "Checking charon.log for successful canal setup"
+  perform_test "Check charon.log for canal setup success message" 'grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1' "==" "Job SERVICE_SETUP fluent/ccg/relay/canal has FINISHED - result: SUCCESS" "==" "" "configuration" 
+
   grep -e "SUCCESS" -e "canal" /home/sailpoint/log/charon.log | tail -n1 >> "$LOGFILE"
   outro
 
@@ -1200,22 +1273,10 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
   sudo journalctl --no-pager -n50 -u canal >> "$LOGFILE"
   outro
 
-  intro "Retrieving last 50 lines of update-service journal logs"
-  sudo journalctl --no-pager -n50 -u update-engine >> "$LOGFILE"
-  outro
-
   echo "*** Completed gathering extra data from Canal config."
   echo "$DIVIDER"
   echo
 fi
-
-intro "Retrieving last 50 lines of kernel journal logs"
-sudo journalctl --no-pager -n50 -k >> "$LOGFILE"
-outro
-
-intro "Retrieving last 50 lines of network journal logs"
-sudo journalctl --no-pager -n50 -u systemd-networkd >> "$LOGFILE"
-outro
 
 intro "Retrieving last 50 lines of logrotate journal logs"
 sudo journalctl --no-pager -n50 -u logrotate >> "$LOGFILE"
@@ -1223,6 +1284,10 @@ outro
 
 intro "Retrieving last 50 lines of ccg journal logs"
 sudo journalctl --no-pager -n50 -u ccg >> "$LOGFILE"
+outro
+
+intro "Retrieving last 50 lines of charon journal logs"
+sudo journalctl --no-pager -n50 -u charon >> "$LOGFILE" 
 outro
 
 intro "Retrieving last 50 lines of va_agent journal logs"
@@ -1233,11 +1298,23 @@ intro "Retrieving last 50 lines of otel_agent journal logs"
 sudo journalctl --no-pager -n50 -u otel_agent >> "$LOGFILE"
 outro
 
+intro "Retrieving last 50 lines of update-service journal logs"
+sudo journalctl --no-pager -n50 -u update-engine >> "$LOGFILE" 
+outro
+
+intro "Retrieving last 50 lines of kernel journal logs"
+sudo journalctl --no-pager -n50 -k >> "$LOGFILE"
+outro
+
+intro "Retrieving last 50 lines of network journal logs"
+sudo journalctl --no-pager -n50 -u systemd-networkd >> "$LOGFILE"
+outro
+
 endscript
 
 if [ "$gather_logs" = true ]; then
   # Get list of files in log directory just in case we need more than these specific files
-  intro "Gathering all log files and zipping."
+  intro "Gathering log files and ccg directory and zipping."
   echo
   echo "*** NOTE: This file might be large depending on the life of your VA. ***"
   echo
@@ -1245,7 +1322,7 @@ if [ "$gather_logs" = true ]; then
     echo "*** Gathering last day of systemd journal ***"
     sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/journal-$(date +%Y%m%d%H%M).log
   fi
-   zip -r $ZIPFILE $LOGFILE $LISTOFLOGS
+   zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR
    echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
   if [ "$capture_journal" = true]; then
     echo "*** Removing temporary systemd journal log ***"
