@@ -81,7 +81,7 @@ fi
 
 
 ### GLOBAL VARIABLES ###
-VERSION="v2.2"
+VERSION="v2.2.1"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}')
@@ -1009,12 +1009,6 @@ intro "External connectivity: Connection test for https://$ORGNAME.api.identityn
 curl -Ssv -i --connect-timeout 10 "https://$ORGNAME.api.identitynow.com" >> "$LOGFILE" 2>&1
 outro
 perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout 10 \"https://$ORGNAME.api.identitynow.com\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
-outro
-
-intro "External connectivity: Connection test for https://$PODNAME.accessiq.sailpoint.com"
-curl -Ssv -i --connect-timeout 10 "https://$PODNAME.accessiq.sailpoint.com" >> "$LOGFILE" 2>&1
-outro
-perform_test "Curl test to IdentityNow pod; expect a result of 302" "curl -i \"https://$PODNAME.accessiq.sailpoint.com\" 2>&1 | grep \"HTTP/2 302\" | wc -l" -gt 0 -eq 0 "networking" # TODO: add HTTP/1.1 302 Found"
 outro
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.us-east-1.amazonaws.com)"
