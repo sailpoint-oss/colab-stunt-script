@@ -107,7 +107,6 @@ else
   esac
 fi
 
-
 ### GLOBAL RUNTIME VARIABLES ###
 
 VERSION="v2.3"
