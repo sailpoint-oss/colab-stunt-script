@@ -110,7 +110,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3"
+VERSION="v2.3.1"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -767,7 +767,6 @@ if [[ "$reset_id_json" == "true" ]]; then
   endscript
 fi
 
-#TODO Check if Charon is 2240 or higher. If so, run OS update with: sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"3975.2.1\"
 update_old_OS_with_new_charon() {
   echo "Updating OS with 'flatcar-update -Q'. This will require a reboot of the VA when complete."
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
@@ -778,7 +777,7 @@ update_old_OS_with_new_charon() {
 }
 
 update_old_os() {
-  current_charon=$(get_current_image_tag sailpoint/charon)
+  current_charon=$(get_current_image_tag charon)
   if [[ $current_charon -gt 2239 ]]; then
     update_old_OS_with_new_charon
   else
@@ -838,13 +837,13 @@ outro
 
 perform_test "Is keyPassphrase length more than 0 characters?" "get_keyPassphrase_length" -gt 0 -lt 1 "configuration"
 if [[ $key_passphrase_length -lt 1 ]]; then
-  echo -e "     $YELLOW ACTION: $RESETCOLOR Check validity of config.yaml; keyPassphrase may still be unencrypted"
+  echo -e "     ${YELLOW}ACTION$RESETCOLOR: Check validity of config.yaml; keyPassphrase may still be unencrypted"
 fi
 outro
 perform_test "Is keyPassphrase length less than 70 characters?" "get_keyPassphrase_length" -lt 70 -gt 69 "configuration"
 if [[ $key_passphrase_length -gt 69 ]]; then
   echo -e "Current keyPassphrase length: $key_passphrase_length chars" >> "$LOGFILE"
-  echo -e "     $YELLOW ACTION: $RESETCOLOR If this cluster has not had any sources added recently, and no new network "
+  echo -e "     ${YELLOW}ACTION$RESETCOLOR: If this cluster has not had any sources added recently, and no new network "
   echo -e "     connectivity issues have been noted or reported, you can likely ignore this failure."
 fi 
 outro 
@@ -1231,6 +1230,7 @@ fi
 
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
+current_charon=$(get_current_image_tag charon)
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
 if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
