@@ -109,7 +109,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.1"
+VERSION="v2.3.2"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -618,7 +618,51 @@ echo $DIVIDER >> "$LOGFILE"
 echo "<SUMMARY_BLOCK>" >> "$LOGFILE"
 outro
 
-# Do update
+# Forced update process
+
+## Forced update functions
+update_old_OS_with_new_charon() {
+  echo "Updating OS with 'flatcar-update -Q'. This will require a reboot of the VA when complete."
+  version=$(get_flatcar_current_version)
+  sudo rm /etc/systemd/system/update-engine.service.d/override.conf
+  if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"$version\"
+  else 
+    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4081.2.1."
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"4081.2.1\"
+  fi
+  sudo rm /etc/systemd/system/update-engine.service.d/override.conf
+  ADD_REBOOT_MESSAGE=true
+  echo 0;
+}
+
+update_old_os() {
+  current_charon=$(get_current_image_tag charon)
+  if [[ $current_charon -gt 2239 ]]; then
+    intro "Attempting modern update because of newer version of charon: v$current_charon. This will require a reboot of the VA when successful."
+    echo "Current charon version: $current_charon"
+    update_old_OS_with_new_charon
+  else
+    intro "Older version of charon: $current_charon. Retrieving Flatcar Linux certificate, and starting OS update. This will require a reboot of the VA when successful."
+    echo "This will reboot the VA when complete."
+    curl -sS https://stable.release.flatcar-linux.net/ >/dev/null
+    sudo rm /etc/ssl/certs/DST_Root_CA_X3.pem
+    sudo update-ca-certificates
+    curl -sS https://stable.release.flatcar-linux.net/ >/dev/null
+
+    # check for existence of sudo permissions to run systemctl restart update-engine; if exists, run it, else try old method
+    if [[ $(sudo -l | grep "systemctl restart update-engine" | wc -l) -gt 0 ]]; then
+      update_engine_result=$(sudo systemctl restart update-engine 2>&1)
+      echo "$update_engine_result" | tee -a "$LOGFILE"
+    else
+      sudo update_engine_client -reset_status && sudo update_engine_client -update >> "$LOGFILE" 2>&1
+    fi
+  fi
+  if [[ $(grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" $LOGFILE | wc -l) -gt 0  ]]; then
+    ADD_REBOOT_MESSAGE=true
+  fi
+}
+
 if [ "$do_update" == "true" ]; then
   intro "Performing forced update - this process resets the machine-id and the update service. *A REBOOT IS REQUIRED WHEN SUCCESSFUL*"
   read -p "Do you need to perform a machine-id reset? Y/n (choosing \"Y\" can force a reboot): " response
@@ -641,15 +685,7 @@ if [ "$do_update" == "true" ]; then
       ;;
     esac
 
-  if [[ $(sudo -l | grep "systemctl restart update-engine" | wc -l) -gt 0 ]]; then
-    update_engine_result=$(sudo systemctl restart update-engine 2>&1)
-    echo "$update_engine_result" | tee -a "$LOGFILE"
-  fi
-  sudo update_engine_client -reset_status && sudo update_engine_client -update >> "$LOGFILE" 2>&1
-  
-  if [[ $(grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" $LOGFILE  | wc -l) -gt 0 ]]; then
-    ADD_REBOOT_MESSAGE=true
-  fi
+  update_old_os
 
   if [[ $(grep "UPDATE_STATUS_REPORTING_ERROR_EVENT" $LOGFILE | wc -l) -gt 0 ]]; then
     echo "Found UPDATE_STATUS_REPORTING_ERROR_EVENT during update; shunting update-engine logs to stuntlog"
@@ -662,8 +698,9 @@ if [ "$do_update" == "true" ]; then
   echo "EXITING"
   exit 0
 fi
+# End forced update procedure
 
-# Do alternating curl test
+# Alternating curl test
 if [ "$curl_test" == "true" ]; then
   intro "Curl test starting"
   echo "Performing alternating curl test against S3 and SQS. This will run for $total_seconds_to_test seconds,"
@@ -765,33 +802,6 @@ if [[ "$reset_id_json" == "true" ]]; then
   done
   endscript
 fi
-
-update_old_OS_with_new_charon() {
-  echo "Updating OS with 'flatcar-update -Q'. This will require a reboot of the VA when complete."
-  sudo rm /etc/systemd/system/update-engine.service.d/override.conf
-  sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"\"
-  sudo rm /etc/systemd/system/update-engine.service.d/override.conf
-  ADD_REBOOT_MESSAGE=true
-  echo 0;
-}
-
-update_old_os() {
-  current_charon=$(get_current_image_tag charon)
-  if [[ $current_charon -gt 2239 ]]; then
-    update_old_OS_with_new_charon
-  else
-    intro "Retrieving Flatcar Linux certificate, and starting OS update. This will require a reboot of the VA when complete."
-    echo "This will reboot the VA when complete."
-    curl -sS https://stable.release.flatcar-linux.net/ >/dev/null
-    sudo rm /etc/ssl/certs/DST_Root_CA_X3.pem
-    sudo update-ca-certificates
-    curl -sS https://stable.release.flatcar-linux.net/ >/dev/null
-    sudo update_engine_client -update && echo "\nCompleted STUNT process." >> "$LOGFILE"
-    if [[ $(grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" $LOGFILE | wc -l) -gt 0  ]]; then
-      ADD_REBOOT_MESSAGE=true
-    fi
-  fi
-}
 
 determine_hosting() {
   host_return_string="undetermined. All attempts to gather metadata were unsuccessful."
@@ -1229,7 +1239,7 @@ fi
 
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
-current_charon=$(get_current_image_tag charon)
+current_charon=$(get_current_image_tag charon) #CS0334845
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
 if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
