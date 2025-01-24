@@ -109,7 +109,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.2"
+VERSION="v2.3.3"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -632,7 +632,6 @@ update_old_OS_with_new_charon() {
     sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"4081.2.1\"
   fi
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
-  ADD_REBOOT_MESSAGE=true
   echo 0;
 }
 
