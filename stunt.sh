@@ -109,7 +109,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.2"
+VERSION="v2.3.3"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -632,7 +632,6 @@ update_old_OS_with_new_charon() {
     sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"4081.2.1\"
   fi
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
-  ADD_REBOOT_MESSAGE=true
   echo 0;
 }
 
@@ -1164,11 +1163,13 @@ outro
 perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -E 'HTTP/2 302 | HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
 outro
 
-intro "External connectivity: Connection test for https://$ORGNAME.$ISC_ACCESS"
-curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_ACCESS" >> "$LOGFILE" 2>&1
-outro
-perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_ACCESS\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
-outro
+if [[ $IS_ORG_FEDRAMP == true ]]; then
+  intro "External connectivity: Connection test for https://$ORGNAME.$ISC_ACCESS"
+  curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_ACCESS" >> "$LOGFILE" 2>&1
+  outro
+  perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_ACCESS\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
+  outro
+fi
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.$AWS_REGION.amazonaws.com)"
 curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://dynamodb.$AWS_REGION.amazonaws.com" >> "$LOGFILE" 2>&1
