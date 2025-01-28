@@ -109,7 +109,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.3"
+VERSION="v2.3.4"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -258,7 +258,7 @@ endscript() {
 }
 
 get_keyPassphrase_length() {
-  cat $CONFIG_YAML_FILE_PATH | grep "::::" | sed "s/keyPassphrase: '//g" | sed "s/'$//gm" | wc -m # Will return 0 if unencrypted
+  cat $CONFIG_YAML_FILE_PATH | grep "keyPassphrase: \"::::" | sed "s/keyPassphrase: '//g" | sed "s/'$//gm" | wc -m # Will return 0 if unencrypted
 }
 
 get_num_share_jobs() {
@@ -1158,7 +1158,7 @@ perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeo
 outro
 
 intro "External connectivity: Connection test for https://$ORGNAME.$ISC_DOMAIN"
-curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
+curl -Ssv -i --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
 outro
 perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -E 'HTTP/2 302 | HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
 outro
@@ -1506,7 +1506,7 @@ intro "Retrieving last 50 lines of otel_agent journal logs"
 sudo journalctl --no-pager -n50 -u otel_agent >> "$LOGFILE"
 outro
 
-intro "Retrieving last 50 lines of update-service journal logs"
+intro "Retrieving last 50 lines of update-service (update-engine) journal logs"
 sudo journalctl --no-pager -n50 -u update-engine >> "$LOGFILE" 
 outro
 
