@@ -109,7 +109,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.4"
+VERSION="v2.3.5"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -127,6 +127,8 @@ AWS_REGIONS=("us-east-1", "us-west-2", "ap-southeast-1", "ap-southeast-2", "ap-n
 AWS_REGION="us-east-1"
 ISC_DOMAIN="identitynow.com"
 ISC_ACCESS="accessiq.sailpoint.com"
+JAVA_OVERWRITES_FILE_PATH="/home/sailpoint/ccg/java_overwrites.yaml"
+IS_CCG_RUNNING=false
 
 # Get main partition name - CS0334359
 if [[ $(findmnt -nro SOURCE / ) ]]; then
@@ -586,6 +588,18 @@ test_openssh_version () {
   fi
 }
 
+check_container_running () {
+  if [[ $(sudo docker ps | grep $1 | wc -l) -gt 0 ]]; then 
+    echo true; 
+  else 
+    echo false; 
+  fi
+}
+
+canal_connection_test () {
+  echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat $1 443 | head -c 5 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m;
+}
+
 ### END FUNCTIONS ###
 
 
@@ -626,10 +640,10 @@ update_old_OS_with_new_charon() {
   version=$(get_flatcar_current_version)
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
   if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"$version\"
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version $version
   else 
-    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4081.2.1."
-    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version \"4081.2.1\"
+    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4152.2.0."
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4152.2.0
   fi
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
   echo 0;
@@ -1006,38 +1020,38 @@ expect "tests below to pass for every IP. On failure(s), ask if DPI (Deep Packet
 if [[ $PODNAME == *"useast1"* ||  $PODNAME == *"cook"* || $PODNAME == *"fiji"* || $PODNAME == *"uswest2"* || $PODNAME == *"cacentral1"* ]]; then
   # us-east-1 PODNAMEs contain: useast1 cook fiji uswest2 cacentral1
   echo "Using us-east-1 endpoints: " | tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 52.206.130.59" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.130.59 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 52.206.130.59" "canal_connection_test 52.206.130.59" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 52.206.133.183" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.133.183 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 52.206.133.183" "canal_connection_test 52.206.133.183" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 52.206.132.240" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.206.132.240 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 52.206.132.240" "canal_connection_test 52.206.132.240" -gt 4 -eq 0 "networking"
   outro
 elif [[ $PODNAME == *"eucentral1"* ]]; then
   # eu-central-1 PODNAMEs contain: eucentral1
   echo "Using eu-central-1 endpoints: " | tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 35.157.132.22" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.132.22 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 35.157.132.22" "canal_connection_test 35.157.132.22" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 35.157.185.79" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.185.79 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 35.157.185.79" "canal_connection_test 35.157.185.79" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 35.157.251.228" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.157.251.228 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 35.157.251.228" "canal_connection_test 35.157.251.228" -gt 4 -eq 0 "networking"
   outro
 elif [[ $PODNAME == *"euwest2"* ]]; then
   #eu-west-2 PODNAMEs contain: euwest2
   echo "Using eu-west-2 endpoints: " | tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 18.130.210.174" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.210.174 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 18.130.210.174" "canal_connection_test 18.130.210.174" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 18.130.148.201" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 18.130.148.201 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 18.130.148.201" "canal_connection_test 18.130.148.201" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 35.178.220.78" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 35.178.220.78 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 35.178.220.78" "canal_connection_test 35.178.220.78" -gt 4 -eq 0 "networking"
   outro
 elif [[ $PODNAME == *"apsoutheast2"* ]]; then
   #apac PODNAMEs contain: apsoutheast2
   echo "Using ap-southeast-2 endpoints: "| tee -a "$LOGFILE"
-  perform_test "Canal Server Connection Test to IP: 52.65.42.92" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 52.65.42.92 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 52.65.42.92" "canal_connection_test 52.65.42.92" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 13.55.78.212" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 13.55.78.212 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 13.55.78.212" "canal_connection_test 13.55.78.212" -gt 4 -eq 0 "networking"
   outro
-  perform_test "Canal Server Connection Test to IP: 3.24.127.50" "echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat 3.24.127.50 443 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m" -gt 10 -eq 0 "networking"
+  perform_test "Canal Server Connection Test to IP: 3.24.127.50" "canal_connection_test 3.24.127.50" -gt 4 -eq 0 "networking"
   outro
 elif [[ $IS_ORG_FEDRAMP == true ]]; then
   #FEDRAMP
@@ -1070,6 +1084,7 @@ outro
 
 
 intro "Retrieving contents of /etc/hosts from ccg container."
+IS_CCG_RUNNING=$(check_container_running "ccg")
 if [[ $IS_CCG_RUNNING == true ]]; then
   sudo docker exec ccg cat /etc/hosts >> "$LOGFILE" 2>&1
 else
@@ -1139,15 +1154,15 @@ outro
 # API: "https://$ORGNAME.$ISC_ACCESS"
 
 # TODO: use ping to check if sites are resolving first, and if successful, then execute curl. The --connect-timeout option isn't working as anticipated.
-intro "External connectivity: Connection test to launchdarkly (https://app.launchdarkly.com) that ignores chain and displays detail about SSL along with HTTP status"
+intro "External connectivity: Connection test to launchdarkly (https://app.launchdarkly.com); ignores chain, outputs SSL info and HTTP status"
 curl -vvvIik --connect-timeout $seconds_between_tests https://app.launchdarkly.com >> "$LOGFILE" 2>&1
 perform_test "Curl test to launchdarkly; expect a result of 405" "curl -vvvIik \"https://app.launchdarkly.com\" 2>&1 | grep \"405\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 # FedRAMP doesn't currently support new VA pairing method, so skip when the org is FedRAMP
 if [[ $IS_ORG_FEDRAMP == false ]]; then
-  intro "External connectivity: Connection test to the va-activation endpoint to get a code" >> "$LOGFILE" 2>&1
-  curl -vvv -k https://va-activation-global.secure-api.infra.identitynow.com/activation/code >> "$LOGFILE" 2>&1
+  intro "External connectivity: Connection test to the va-activation endpoint to get a code"
+  { curl -vvv -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" 2>&1 || true; } >> "$LOGFILE"
   outro
 fi
 
@@ -1279,13 +1294,13 @@ fi
 outro
 
 expect "the following four (4) processes to be running: ccg, va_agent, charon, and va."
-perform_test "Is ccg running?" "sudo docker ps | grep ccg | wc -l" -eq 1 -lt 1 "system"
+perform_test "Is ccg running?" "check_container_running \"ccg\"" "==" "true" "==" "false" "system"
 outro
-perform_test "Is va_agent running?" "sudo docker ps | grep va_agent | wc -l" -eq 1 -lt 1 "system"
+perform_test "Is va_agent running?" "check_container_running \"va_agent\"" "==" "true" "==" "false" "system"
 outro
-perform_test "Is charon running?" "sudo docker ps | grep charon | wc -l" -eq 1 -lt 1 "system"
+perform_test "Is charon running?" "check_container_running \"charon\"" "==" "true" "==" "false" "system"
 outro
-perform_test "Is va (fluent) running?" "sudo docker ps | grep 'va:current' | wc -l" -eq 1 -lt 1 "system"
+perform_test "Is va (fluent) running?" "check_container_running \"fluent\"" "==" "true" "==" "false" "system"
 outro
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
@@ -1466,6 +1481,17 @@ outro
 
 intro "Gathering logrotate configuration info"
 cat /usr/share/logrotate/logrotate.conf >> "$LOGFILE"
+outro
+
+intro "Checking for modified ccg java heap settings"
+expect "file not found at location: $JAVA_OVERWRITES_FILE_PATH."
+if [[ -e  $JAVA_OVERWRITES_FILE_PATH ]]; then
+  echo -e "${CYAN}INFO:$RESETCOLOR Found java heap settings have been manually set. Please follow compatibility guidelines." | tee -a "$LOGFILE"
+  echo -e "https://community.sailpoint.com/t5/IdentityNow-Draft-Documents/Increasing-memory-usage-on-the-VA-Java-heap/ta-p/78766"
+  cat $JAVA_OVERWRITES_FILE_PATH >> "$LOGFILE"
+else
+  echo -e "Overwrites file not found."
+fi
 outro
 
 intro "Retrieving last 25 lines of error logs from dmesg"
