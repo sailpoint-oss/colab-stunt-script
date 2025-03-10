@@ -5,6 +5,7 @@ CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
 CONFIG_YAML_FILE_PATH="/home/sailpoint/config.yaml"
+MACHINE_ID="$(cat /etc/machine-id)"
 IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}')
 
 # colors for output
@@ -77,9 +78,10 @@ fi
 ### INIT ###
 if [[ -e "$CONFIG_YAML_FILE_PATH" ]]; then
   # Set global vars whose data come from config.yaml
-  ORGNAME=$(grep -oP '(?<=org: ).*' $CONFIG_YAML_FILE_PATH)
+  CONFIG_YAML=$(< $CONFIG_YAML_FILE_PATH)
+  ORGNAME=$(echo "$CONFIG_YAML" | grep -oP '(?<=org: ).*')
   ORGNAME="${ORGNAME//$'\r'/}" #remove return characters
-  PODNAME=$(grep -oP '(?<=pod: ).*' $CONFIG_YAML_FILE_PATH)
+  PODNAME=$(echo "$CONFIG_YAML" | grep -oP '(?<=pod: ).*')
   PODNAME="${PODNAME//$'\r'/}" #remove return characters
 else
   echo "*** Config file not found. "
@@ -109,7 +111,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.5"
+VERSION="v2.3.6"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -129,6 +131,7 @@ ISC_DOMAIN="identitynow.com"
 ISC_ACCESS="accessiq.sailpoint.com"
 JAVA_OVERWRITES_FILE_PATH="/home/sailpoint/ccg/java_overwrites.yaml"
 IS_CCG_RUNNING=false
+IS_IAI_VA=$(echo "$CONFIG_YAML" | grep -iq "iai:" && echo true || echo false)
 
 # Get main partition name - CS0334359
 if [[ $(findmnt -nro SOURCE / ) ]]; then
@@ -176,12 +179,13 @@ help () {
   echo "VA, and places that data into a stuntlog text file in your home directory."
   echo "Collecting this helps SailPoint Support Engineers troubleshoot your system."
   echo
-  echo "Syntax: ./stunt.sh [-h] [-t,p,f,l/L,j|u|c|r]"
+  echo "Syntax: ./stunt.sh [-h] [-t,p,f,o,l/L,j|u|c|r]"
   echo "Options:"
   echo "h   Print this help info then exit"
   echo "t   Add traceroute test to SQS"
   echo "p   Add ping test"
   echo "f   Add automatic fixup steps"
+  echo "o   Add openssl config file into stuntlog"
   echo "l/L Add collection of log files and archive them along with stuntlog file."
   echo "j   Add collection of the last day of the systemd journal (requires -l/-L)"
   echo "u   Only perform forced OS update (this will make system changes) then exit"
@@ -190,7 +194,7 @@ help () {
 }
 
 # Get cmd line args
-while getopts ":htpuflLjocer" option; do
+while getopts ":htpfolLjucr" option; do
   case $option in
     h) #display help
       help
@@ -199,20 +203,22 @@ while getopts ":htpuflLjocer" option; do
       do_traceroute=true;;
     p)
       do_ping=true;;
-    u)
-      do_update=true;;
     f)
       do_fixup=true;;
+    o)
+      get_ssl_conf=true;;
     l)
       gather_logs=true;;
     L)
       gather_logs=true;;
+    j)
+      capture_journal=true;;
+    u)
+      do_update=true;;
     c)
       curl_test=true;;
     r)
       reset_id_json=true;;
-    j)
-      capture_journal=true;;
     \?)
       echo "Invalid argument on command line. Please review help below:"
       help
@@ -355,7 +361,7 @@ handle_error() {
   intro "Script encountered an error with the following command: ${BASH_COMMAND}."
   echo "The stuntlog file at $LOGFILE contains an error due to the exception. Continuing... "
   echo -e "Test $test_name: WARNING" >> "$LOGFILE"
-  echo -e "Test $test_name: $YELLOW WARNING $RESETCOLOR"
+  echo -e "Test $test_name: {$YELLOW}WARNING $RESETCOLOR"
   add_test_result "script" "Error handler" "warn" "$1"
   ((warnings++))
   outro
@@ -446,7 +452,7 @@ canalenv_exists() {
       echo "Creating canal.env"
       touch /home/sailpoint/canal.env
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup "
+      echo -e "{$YELLOW}ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup "
       echo -e "is not enabled. Rerun STUNT with -f to create the canal.env file"
     fi
     echo 1
@@ -462,7 +468,7 @@ canal_log_contains_FNF_string() {
       echo "Creating canal-hc.log" | tee -a "$LOGFILE"
       touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR 'No such file or directory' error found in canal-hc.log," | tee -a "$LOGFILE"
+      echo -e "{$YELLOW}ACTION: $RESETCOLOR 'No such file or directory' error found in canal-hc.log," | tee -a "$LOGFILE"
       echo -e "but the option for automatic fixup is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
     fi
     echo 1
@@ -501,7 +507,7 @@ detect_old_os_version() {
       update_old_os
       echo 0
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR Old OS detected, but fixup flag is not enabled." | tee -a "$LOGFILE"
+      echo -e "{$YELLOW}ACTION: $RESETCOLOR Old OS detected, but fixup flag is not enabled." | tee -a "$LOGFILE"
       echo -e "Rerun STUNT with -f to attempt the automatic update process." | tee -a "$LOGFILE"
       echo 1
     fi
@@ -623,13 +629,20 @@ else
   touch $LOGFILE
 fi
 
+# CS0363009
 # Start the tests by placing a header in the logfile
-echo $DIVIDER
+echo $DIVIDER | tee -a "$LOGFILE"
 echo "$(date -u) - STARTING TESTS for $ORGNAME on $PODNAME"
 echo $DIVIDER
-echo "$(date -u) - START TESTS for $ORGNAME on $PODNAME using stunt.sh $VERSION " >> "$LOGFILE"
+echo "*** STARTING TESTS ***" >> "$LOGFILE"
+echo "Date:        $(date -u)" >> "$LOGFILE"
+echo "Stunt ver.:  $VERSION" >> "$LOGFILE"
+echo "Org:         $ORGNAME" >> "$LOGFILE"
+echo "Pod:         $PODNAME" >> "$LOGFILE"
+echo "Machine-id:  $MACHINE_ID" >> "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
 echo "<SUMMARY_BLOCK>" >> "$LOGFILE"
+echo $DIVIDER >> "$LOGFILE"
 outro
 
 # Forced update process
@@ -643,7 +656,7 @@ update_old_OS_with_new_charon() {
     sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version $version
   else 
     echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4152.2.0."
-    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4152.2.0
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4152.2.1
   fi
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
   echo 0;
@@ -681,13 +694,12 @@ if [ "$do_update" == "true" ]; then
   read -p "Do you need to perform a machine-id reset? Y/n (choosing \"Y\" can force a reboot): " response
     case $response in
       [Yy])
-        old_machine_id=$(cat /etc/machine-id)
-        echo "Old ID: $old_machine_id"
+        echo "Old ID: $MACHINE_ID"
         sudo rm -f /etc/machine-id  >> "$LOGFILE" 2>&1
         sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
         new_machine_id=$(cat /etc/machine-id)
         echo "New ID: $new_machine_id"
-        if [[ $old_machine_id == $new_machine_id ]]; then
+        if [[ $MACHINE_ID == $new_machine_id ]]; then
           echo "Old and new IDs match; interrupting update process and forcing a reboot" | tee -a "$LOGFILE"
           sleep 5
           endscript
@@ -760,8 +772,8 @@ if [[ "$reset_id_json" == "true" ]]; then
   ellipsis_index=0
   expect "the file at $id_json_filepath/$id_json_filename to be deleted and a new copy generated."
   while true; do
-    echo "$YELLOW *** Do not perform this operation if this VA was paired with a code generated by va-bootstrap. *** $RESETCOLOR"
-    echo "$YELLOW *** Use the 'va-bootstrap' script again instead. *** $RESETCOLOR"
+    echo "$YELLOW*** Do not perform this operation if this VA was paired with a code generated by va-bootstrap. *** $RESETCOLOR"
+    echo "$YELLOW*** Use the 'va-bootstrap' script again instead. *** $RESETCOLOR"
     read -p "Type 'Y' (caps only) to confirm file delete for $id_json_filepath/$id_json_filename: " response
     case $response in
       [Y])
@@ -891,7 +903,7 @@ outro
 ntp_result=$(ntp_sync)
 perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
-  echo -e "     $YELLOW ACTION: $RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
+  echo -e "     {$YELLOW}ACTION: $RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
   echo -e "     https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server" | tee -a "$LOGFILE"
 fi
 outro
@@ -914,7 +926,7 @@ elif test -f /home/sailpoint/log/ccg-start.log; then
 elif test -f /home/sailpoint/log/ccg.log; then
   echo "Grep in ccg.log: $(grep -iE 'OpenJDK_64-Bit_Server_VM' /home/sailpoint/log/ccg.log | awk -F'OpenJDK_64-Bit_Server_VM' '{if (NF>1) {match($2, /[0-9]+\.[0-9]+\.[0-9]+/, version); if (version[0] != "") print version[0]}}' | tail -n1)" >> "$LOGFILE"
 else
-  echo -e "$YELLOW WARNING: $RESETCOLOR Unable to find any log files to grep!"
+  echo -e "{$YELLOW}WARNING: $RESETCOLOR Unable to find any log files to grep!"
 fi
 outro
 
@@ -961,8 +973,9 @@ if test -f $PROXY_FILE_PATH ; then
   intro "Retrieving the proxy config"
   cat $PROXY_FILE_PATH >> "$LOGFILE"
 
+  # CS0363011
   if [[ $(grep "no_proxy" $PROXY_FILE_PATH | wc -l) -ge 1 ]]; then
-    perform_test "Is the value held in 'no_proxy' surrounded by double quotes?" "no_proxy_double_quotes" -ge 1 -le 0 "configuration"
+    perform_test "Is the value held in 'no_proxy' surrounded by double quotes?" "no_proxy_double_quotes" -eq 0 -ge 1 "configuration"
   fi
   outro
 fi
@@ -1110,22 +1123,25 @@ if [[ "$do_fixup" == true ]]; then
   outro
 fi
 
-intro "Checking for the existence of override.conf - we expect this file not to exist"
+# CS0363017
+intro "Checking for the existence of override.conf"
 expect "this file not to exist"
 if [[ -e /etc/systemd/system/update-engine.service.d/override.conf ]]; then
   if [[ "$do_fixup" == true ]]; then
     echo -e "${INFO}INFO$RESETCOLOR: override.conf found and fixup enabled. Attempting removal..." | tee -a "$LOGFILE"
     sudo rm /etc/systemd/system/update-engine.service.d/override.conf | tee -a "$LOGFILE"
   fi
-  echo "override.conf file found, but fixup option is not enabled. Rerun script with fixup (-f) to attempt repair." | tee -a "$LOGFILE"
+  echo -e "${YELLOW}ACTION: {$RESETCOLOR}override.conf file found, but fixup option is not enabled. Rerun script with fixup (-f) to remove this file." | tee -a "$LOGFILE"
 else
-  echo "File not found, as expected"
+  echo "File not found, as expected" | tee -a "$LOGFILE"
 fi
 outro
 
-intro "Retrieving openssl config file contents"
-cat /etc/ssl/openssl.cnf >> "$LOGFILE"
-outro
+if [[ "$get_ssl_conf" == true ]]; then
+  intro "Retrieving openssl config file contents"
+  cat /etc/ssl/openssl.cnf >> "$LOGFILE"
+  outro
+fi
 
 intro "Retrieving list of all SSL certs in $CERT_DIRECTORY"
 ls -alh $CERT_DIRECTORY >> "$LOGFILE" 2>&1
@@ -1154,10 +1170,12 @@ outro
 # API: "https://$ORGNAME.$ISC_ACCESS"
 
 # TODO: use ping to check if sites are resolving first, and if successful, then execute curl. The --connect-timeout option isn't working as anticipated.
-intro "External connectivity: Connection test to launchdarkly (https://app.launchdarkly.com); ignores chain, outputs SSL info and HTTP status"
-curl -vvvIik --connect-timeout $seconds_between_tests https://app.launchdarkly.com >> "$LOGFILE" 2>&1
-perform_test "Curl test to launchdarkly; expect a result of 405" "curl -vvvIik \"https://app.launchdarkly.com\" 2>&1 | grep \"405\" | wc -l" -gt 0 -eq 0 "networking"
-outro
+if [[ $IS_IAI_VA == true ]]; then
+  intro "External connectivity: Connection test to launchdarkly (https://app.launchdarkly.com); ignores chain, outputs SSL info and HTTP status"
+  curl -vvvIik --connect-timeout $seconds_between_tests https://app.launchdarkly.com >> "$LOGFILE" 2>&1
+  perform_test "Curl test to launchdarkly; expect a result of 405" "curl -vvvIik \"https://app.launchdarkly.com\" 2>&1 | grep \"405\" | wc -l" -gt 0 -eq 0 "networking"
+  outro
+fi
 
 # FedRAMP doesn't currently support new VA pairing method, so skip when the org is FedRAMP
 if [[ $IS_ORG_FEDRAMP == false ]]; then
@@ -1451,7 +1469,7 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
       echo "Creating canal-hc.log" | tee -a "$LOGFILE"
       touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
     else
-      echo -e "$YELLOW ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
+      echo -e "{$YELLOW}ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
       echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
     fi
   fi
@@ -1506,7 +1524,7 @@ if [ $? -gt 0 ] && [ -e /home/sailpoint/log/ccg.log.1 ]; then
     echo "Found corrupted logrotate cache. Attempting fixup." >> "$LOGFILE"
     echo "-----" >> /home/sailpoint/log/ccg.log.1 && sudo systemctl start logrotate.service
   else 
-    echo -e "$YELLOW ACTION: $RESETCOLOR 'No such file or directory' error found in logrotate.service journal logs," | tee -a "$LOGFILE"
+    echo -e "{$YELLOW}ACTION: $RESETCOLOR 'No such file or directory' error found in logrotate.service journal logs," | tee -a "$LOGFILE"
     echo -e "but the option for automatic fixup is not enabled. Rerun STUNT with -f to attempt automatic correction." | tee -a "$LOGFILE"
   fi
 fi
@@ -1532,8 +1550,19 @@ intro "Retrieving last 50 lines of otel_agent journal logs"
 sudo journalctl --no-pager -n50 -u otel_agent >> "$LOGFILE"
 outro
 
-intro "Retrieving last 50 lines of update-service (update-engine) journal logs"
-sudo journalctl --no-pager -n50 -u update-engine >> "$LOGFILE" 
+intro "Retrieving last 2 hours of update-service (update-engine) journal logs"
+sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE" 
+if grep -q "Unknown Omaha response status: error-internal" "$LOGFILE"; then
+  echo -e "{$YELLOW}WARNING: {$RESETCOLOR} Found 'Unknown Omaha response status: error-internal'"
+  echo "This indicates a machine-id conflict between this instance and the update server."
+  if [[ "$do_fixup" == true ]]; then
+    echo "Removing the machine-id automatically. A REBOOT IS REQUIRED."
+    sudo rm -f /etc/machine-id && ADD_REBOOT_MESSAGE=true
+  else
+    echo -e "{$YELLOW}ACTION: $RESETCOLOR The machine-id must be reset, but the option for automatic fixup "
+    echo "is not enabled. Re-run stunt with the '-f' flag."
+  fi
+fi
 outro
 
 intro "Retrieving last 50 lines of kernel journal logs"
@@ -1579,7 +1608,7 @@ fi
 
 all_test_results=$(output_all_tests_by_category)
 
-echo $DIVIDER
+echo $DIVIDER | tee -a "$LOGFILE"
 echo "Testing summary"
 echo $DIVIDER
 echo -e "Tests passed:                           $GREEN $passes $RESETCOLOR"
@@ -1588,16 +1617,17 @@ echo -e "Test warnings:                          $YELLOW $warnings $RESETCOLOR"
 echo
 echo $DIVIDER
 
-summary="Testing summary \n
-Tests passed:   $passes \n
-Tests failed:    $failures \n
-Test warnings:  $warnings \n
+summary="*** Post test summary ***
+Tests passed:   $passes 
+Tests failed:    $failures 
+Test warnings:  $warnings 
 
-All tests sorted by category: \n
-$all_test_results \n"
+Tests:
+$all_test_results"
 
+# CS0360919
 echo "$summary" > /tmp/summary_temp.txt
-awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE
+awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync
 rm /tmp/summary_temp.txt
 
 if [ "$gather_logs" = true ]; then
