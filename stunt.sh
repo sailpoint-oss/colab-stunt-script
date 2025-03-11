@@ -1550,6 +1550,7 @@ intro "Retrieving last 50 lines of otel_agent journal logs"
 sudo journalctl --no-pager -n50 -u otel_agent >> "$LOGFILE"
 outro
 
+# CS0360097
 intro "Retrieving last 2 hours of update-service (update-engine) journal logs"
 sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE" 
 if grep -q "Unknown Omaha response status: error-internal" "$LOGFILE"; then
