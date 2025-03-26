@@ -111,7 +111,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.6"
+VERSION="v2.3.7"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -606,6 +606,17 @@ canal_connection_test () {
   echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat $1 443 | head -c 5 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m;
 }
 
+#CS0371476
+check_no_proxy_validate_format() {
+  local value=$(awk -F': ' '/^no_proxy:/ {print $2}' "$PROXY_FILE_PATH")
+  if [[ ! "$value" =~ ^\"?[a-zA-Z0-9|.]+\"?$ ]]; then
+    echo 1
+  fi
+  
+  # Success:
+  echo 0
+}
+
 ### END FUNCTIONS ###
 
 
@@ -651,7 +662,9 @@ outro
 update_old_OS_with_new_charon() {
   echo "Updating OS with 'flatcar-update -Q'. This will require a reboot of the VA when complete."
   version=$(get_flatcar_current_version)
-  sudo rm /etc/systemd/system/update-engine.service.d/override.conf
+  if [[ -e /etc/systemd/system/update-engine.service.d/override.conf ]]; then
+    sudo rm /etc/systemd/system/update-engine.service.d/override.conf
+  fi
   if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version $version
   else 
@@ -828,7 +841,7 @@ if [[ "$reset_id_json" == "true" ]]; then
   endscript
 fi
 
-determine_hosting() {
+determine_hosting() { #TODO - test unreliable
   host_return_string="undetermined. All attempts to gather metadata were unsuccessful."
   # check if EC2
   if curl -s -L --connect-timeout 2 http://169.254.169.254/latest/meta-data/ > /dev/null; then
@@ -969,6 +982,7 @@ expect "DNS entries to match those in static.network, if it exists."
 cat /etc/resolv.conf >> "$LOGFILE"
 outro
 
+# tests for proxy.yaml
 if test -f $PROXY_FILE_PATH ; then
   intro "Retrieving the proxy config"
   cat $PROXY_FILE_PATH >> "$LOGFILE"
@@ -976,6 +990,7 @@ if test -f $PROXY_FILE_PATH ; then
   # CS0363011
   if [[ $(grep "no_proxy" $PROXY_FILE_PATH | wc -l) -ge 1 ]]; then
     perform_test "Is the value held in 'no_proxy' surrounded by double quotes?" "no_proxy_double_quotes" -eq 0 -ge 1 "configuration"
+    perform_test "Is the value held in 'no_proxy' properly formatted and contains no commas?" "check_no_proxy_validate_format" -eq 0 -ge 1 "configuration"
   fi
   outro
 fi
@@ -1365,10 +1380,10 @@ expect "the subset to contain up-to-date version information for containers requ
 cat /opt/sailpoint/share/service-config.json | jq .dependencies >> "$LOGFILE"
 outro
 
-intro "Attempting to determine the hardware host of this VA"
-host_string=$(determine_hosting)
-echo "Hosting solution is $host_string" | tee -a "$LOGFILE"
-outro
+# intro "Attempting to determine the hardware host of this VA"
+# host_string=$(determine_hosting)
+# echo "Hosting solution is $host_string" | tee -a "$LOGFILE"
+# outro
 
 intro "If this system is hosted as a Hyper-V VM imported from the Azure VHD, disable waagent."
 if [[ $host_string == "Microsoft Azure" ]]; then
@@ -1588,19 +1603,19 @@ outro
 
 endscript
 
-if [ "$gather_logs" = true ]; then
+if [ "$gather_logs" == true ]; then
   # Get list of files in log directory just in case we need more than these specific files
   intro "Gathering log files and ccg directory and zipping."
   echo
   echo "*** NOTE: This file might be large depending on the life of your VA. ***"
   echo
-  if [ "$capture_journal" = true]; then
+  if [ "$capture_journal" == true ]; then
     echo "*** Gathering last day of systemd journal ***"
     sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/journal-$(date +%Y%m%d%H%M).log
   fi
    zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR
    echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
-  if [ "$capture_journal" = true]; then
+  if [ "$capture_journal" == true ]; then
     echo "*** Removing temporary systemd journal log ***"
     rm /home/sailpoint/journal-*.log
   fi
@@ -1631,7 +1646,7 @@ echo "$summary" > /tmp/summary_temp.txt
 awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync
 rm /tmp/summary_temp.txt
 
-if [ "$gather_logs" = true ]; then
+if [ "$gather_logs" == true ]; then
   echo
   echo "*** RETRIEVE THE ZIPPED FILE WITHOUT RENAMING:"
   echo "*** ${ZIPFILE} "
