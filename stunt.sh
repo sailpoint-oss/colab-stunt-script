@@ -7,6 +7,8 @@ ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for th
 CONFIG_YAML_FILE_PATH="/home/sailpoint/config.yaml"
 MACHINE_ID="$(cat /etc/machine-id)"
 IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}')
+DOCKER_PS_OUTPUT=$(sudo docker ps -s)
+DOCKER_IMAGES_OUTPUT=$(sudo docker images)
 
 # colors for output
 GREEN='\033[0;32m'
@@ -51,8 +53,8 @@ else
     echo "This VA has at least $ROOT_FS_MINIMUM_FREE_KB_EMERGENCY kb root disk free"
   else
     echo "This VA is critically low on disk space. Attempting cleanup"
-    current_images=$(sudo docker images | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
-    sudo docker images | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
+    current_images=$( echo "$DOCKER_IMAGES_OUTPUT" | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
+    echo "$DOCKER_IMAGES_OUTPUT" | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
     sudo rm -f /home/sailpoint/log/*.{0,1}  # delete rotated logs
     sudo journalctl --no-pager --rotate
     sudo journalctl --no-pager --vacuum-time=1d
@@ -78,11 +80,17 @@ fi
 ### INIT ###
 if [[ -e "$CONFIG_YAML_FILE_PATH" ]]; then
   # Set global vars whose data come from config.yaml
-  CONFIG_YAML=$(< $CONFIG_YAML_FILE_PATH)
-  ORGNAME=$(echo "$CONFIG_YAML" | grep -oP '(?<=org: ).*')
-  ORGNAME="${ORGNAME//$'\r'/}" #remove return characters
-  PODNAME=$(echo "$CONFIG_YAML" | grep -oP '(?<=pod: ).*')
-  PODNAME="${PODNAME//$'\r'/}" #remove return characters
+  CONFIG_YAML=$(< $CONFIG_YAML_FILE_PATH )
+  ORGNAME=$( echo "$CONFIG_YAML" | grep -oP '(?<=org: ).*' )
+  ORGNAME="${ORGNAME//$'\r'/}"                                #remove return characters
+  PODNAME=$( echo "$CONFIG_YAML" | grep -oP '(?<=pod: ).*' )
+  PODNAME="${PODNAME//$'\r'/}"                                #remove return characters
+  # detect Canal in config.yaml
+  if [[ $(echo $CONFIG_YAML | grep "^[[:space:]]*tunnelTraffic: true" | wc -l) -gt 0 ]]; then
+    IS_CANAL_ENABLED=true
+  else
+    IS_CANAL_ENABLED=false
+  fi
 else
   echo "*** Config file not found. "
   echo "*** Would you like to create a temporary config.yaml so stunt can run?"
@@ -111,7 +119,7 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.7"
+VERSION="v2.3.8"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
@@ -121,7 +129,6 @@ CCGDIR="/home/sailpoint/ccg/"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
 FLATCAR_STABLE_RELEASE_FILE="https://stable.release.flatcar-linux.net/amd64-usr/current/version.txt"
-IS_CANAL_ENABLED=false
 CERT_DIRECTORY="/home/sailpoint/certificates"
 ADD_REBOOT_MESSAGE=false # Flip if reboot is required; makes a colorful message appear on stdout
 PROXY_FILE_PATH="/home/sailpoint/proxy.yaml"
@@ -179,22 +186,22 @@ help () {
   echo "VA, and places that data into a stuntlog text file in your home directory."
   echo "Collecting this helps SailPoint Support Engineers troubleshoot your system."
   echo
-  echo "Syntax: ./stunt.sh [-h] [-t,p,f,o,l/L,j|u|c|r]"
+  echo "Syntax: ./stunt.sh [-h] [-t,p,f,o,s,l/L,j|u|c]"
   echo "Options:"
   echo "h   Print this help info then exit"
   echo "t   Add traceroute test to SQS"
   echo "p   Add ping test"
   echo "f   Add automatic fixup steps"
   echo "o   Add openssl config file into stuntlog"
+  echo "s   Pulls a server-based certificate from the IQService server and installs it in /home/sailpoint/certificates/"
   echo "l/L Add collection of log files and archive them along with stuntlog file."
   echo "j   Add collection of the last day of the systemd journal (requires -l/-L)"
   echo "u   Only perform forced OS update (this will make system changes) then exit"
   echo "c   Only perform a curl test that connects to SQS and S3, one test every four seconds for three minutes then exit"
-  echo "r   Only reset your <id>.json file. ***Do not run this flag unless instructed to do so by support***"
 }
 
 # Get cmd line args
-while getopts ":htpfolLjucr" option; do
+while getopts ":htpfoslLjucr" option; do
   case $option in
     h) #display help
       help
@@ -207,18 +214,19 @@ while getopts ":htpfolLjucr" option; do
       do_fixup=true;;
     o)
       get_ssl_conf=true;;
+    s)
+      get_iqs_cert_process=true;;
     l)
       gather_logs=true;;
     L)
-      gather_logs=true;;
+      gather_logs=true
+      LOGFILE=/home/sailpoint/stuntlog-$ORGNAME-$IPADDR.log;;
     j)
       capture_journal=true;;
     u)
       do_update=true;;
     c)
       curl_test=true;;
-    r)
-      reset_id_json=true;;
     \?)
       echo "Invalid argument on command line. Please review help below:"
       help
@@ -266,7 +274,7 @@ endscript() {
 }
 
 get_keyPassphrase_length() {
-  cat $CONFIG_YAML_FILE_PATH | grep "keyPassphrase: \"::::" | sed "s/keyPassphrase: '//g" | sed "s/'$//gm" | wc -m # Will return 0 if unencrypted
+  cat $CONFIG_YAML_FILE_PATH | grep -E "keyPassphrase: ['\"]::::" | sed -E "s/keyPassphrase: ['\"]//g" | sed -E "s/['\"]$//gm" | wc -m # Will return 0 if unencrypted
 }
 
 get_num_share_jobs() {
@@ -307,28 +315,28 @@ perform_test() {
   echo -e $DIVIDER
 
   if [ "$pass_comparison_operator" = "==" ] && [ "$output" = "$pass_expected_condition" ]; then
-    echo -e "Test - PASS: $test_name" >> "$LOGFILE"
-    echo -e "Test -$GREEN PASS$RESETCOLOR: $test_name"
+    echo -e "PASS: $test_name" >> "$LOGFILE"
+    echo -e "$GREEN PASS$RESETCOLOR: $test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" = "==" ] && [ "$output" = "$fail_expected_condition" ]; then
-    echo -e "Test - FAIL: $test_name" >> "$LOGFILE"
-    echo -e "Test -$RED FAIL$RESETCOLOR: $test_name"
+    echo -e "FAIL: $test_name" >> "$LOGFILE"
+    echo -e "{$RED}FAIL$RESETCOLOR: $test_name"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   elif [ "$pass_comparison_operator" != "==" ] && [ "$output" "$pass_comparison_operator" "$pass_expected_condition" ]; then
-    echo -e "Test - PASS: $test_name" >> "$LOGFILE"
-    echo -e "Test -$GREEN PASS$RESETCOLOR: $test_name"
+    echo -e "PASS: $test_name" >> "$LOGFILE"
+    echo -e "{$GREEN}PASS$RESETCOLOR: $test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" != "==" ] && [ "$output" "$fail_comparison_operator" "$fail_expected_condition" ]; then
-    echo -e "Test - FAIL: $test_name" >> "$LOGFILE"
-    echo -e "Test -$RED FAIL$RESETCOLOR: $test_name"
+    echo -e "FAIL: $test_name" >> "$LOGFILE"
+    echo -e "{$RED}FAIL$RESETCOLOR: $test_name"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   else
-    echo -e "Test - WARNING: $test_name" >> "$LOGFILE"
-    echo -e "Test -$YELLOW WARNING$RESETCOLOR: $test_name"
+    echo -e "WARNING: $test_name" >> "$LOGFILE"
+    echo -e "{$YELLOW}WARNING$RESETCOLOR: $test_name"
     ((warnings++))
     add_test_result "$test_category" "$test_name" "warn" "$output"
   fi
@@ -526,6 +534,11 @@ get_flatcar_current_version() { #"https://www.flatcar.org/releases"
   fi
 }
 
+get_update_engine_status() {
+  UPDATE_ENGINE_STATUS_TEXT=$(sudo update_engine_client -status 2>/dev/null | awk -F '=' '/^CURRENT_OP/ { print $2 }')
+  echo $UPDATE_ENGINE_STATUS_TEXT
+}
+
 # CS0245929
 no_proxy_double_quotes() {
   no_proxy_value=$(grep "^no_proxy:" "$PROXY_FILE_PATH" | awk -F': ' '{print $2}')
@@ -539,15 +552,15 @@ no_proxy_double_quotes() {
 
 get_current_image_tag() {
   image_name="$1"
-  current_image_id=$(sudo docker images | grep "$image_name" | grep current | head -n 1 | awk '{print $3}')
-  current_image_tag=$(sudo docker images | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}')
+  current_image_id=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep current | head -n 1 | awk '{print $3}')
+  current_image_tag=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}')
   echo "$current_image_tag" | grep -o '^[[:digit:]]*'
 }
 
 clean_non_current_images() {
   echo "Cleaning images, errors can be ignored"
-  current_images=$(sudo docker images | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
-  sudo docker images | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
+  current_images=$(echo "$DOCKER_IMAGES_OUTPUT" | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
+  echo "$DOCKER_IMAGES_OUTPUT" | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
   echo "Cleaning is complete"
 }
 
@@ -578,7 +591,7 @@ fix_missing_images() {
 
 test_openssh_version () {
   required_major_version=9
-  required_minor_version=7 # require v9.7 or above
+  required_minor_version=8 # require v9.7 or above
   openssh_version_output=$(ssh -V 2>&1)
   openssh_version=$(echo "$openssh_version_output" | grep -oP '(?<=OpenSSH_)[0-9]+\.[0-9]+')
   openssh_major_version=$(echo $openssh_version | cut -d '.' -f 1)
@@ -595,7 +608,7 @@ test_openssh_version () {
 }
 
 check_container_running () {
-  if [[ $(sudo docker ps | grep $1 | wc -l) -gt 0 ]]; then 
+  if [[ $( echo "$DOCKER_PS_OUTPUT" | grep $1 | wc -l) -gt 0 ]]; then 
     echo true; 
   else 
     echo false; 
@@ -611,11 +624,78 @@ check_no_proxy_validate_format() {
   local value=$(awk -F': ' '/^no_proxy:/ {print $2}' "$PROXY_FILE_PATH")
   if [[ ! "$value" =~ ^\"?[a-zA-Z0-9|.]+\"?$ ]]; then
     echo 1
+    return
   fi
   
   # Success:
   echo 0
 }
+
+get_lscpu_num_cpus () {
+  lscpu | grep -i ^CPU\(s | awk '{print $2}'
+}
+
+get_network_adapter_name () {
+  ip -o link show | awk -F': ' '/state UP/ && $2 != "lo" {print $2; exit}'
+}
+
+#CS0390746
+get_iqservice_cert () {
+  local iqservice_network_address
+  local iqservice_secure_port
+  local repeat=true
+  
+  while $repeat; do
+    read -p "Enter the IP address or hostname of the IQService server: " iqservice_network_address
+    read -p "Enter the TLS port for the IQService (usually 5050 or 5051): " iqservice_secure_port
+    local cert_filepath="/home/sailpoint/certificates/${iqservice_network_address}.cer"
+    openssl s_client -connect $iqservice_network_address:$iqservice_secure_port 2>/dev/null | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > $cert_filepath &&  
+      sudo systemctl restart ccg && 
+      sync
+
+    if test -f $cert_filepath ; then                                                     # if new cert exists,
+      if [ $(stat -c%s $cert_filepath) -gt 0 ]; then                                     # and it isn't empty
+        echo -e "${GREEN}SUCCESS ${RESETCOLOR}- Certificate was added at $cert_filepath" # then success
+      else
+        echo -e "${YELLOW}WARN ${RESETCOLOR}- New certificate file is blank; check your server string and port information, then try again."
+      fi
+    else
+      echo -e "${RED}FAIL ${RESETCOLOR}- The file for ${cert_filepath} was not found - check your server string and port information, then try again."
+      endscript
+      exit 1
+    fi
+    read -p "Pull another cert? [y/n]: " again
+    case $again in
+      [Yy])
+        repeat=true
+      ;;
+      *)
+        repeat=false
+        echo -e "Ending script"
+      ;;
+    esac
+  done
+  endscript
+  echo "EXITING"
+  exit 0
+}
+
+#CS0380481
+get_top_output() {
+  top -b -n 1 | awk '
+  BEGIN {FS=" "}
+  NR==1 {print; next}
+  NR==2 {print; next}
+  NR==3 {print; next}
+  NR==4 {print; next}
+  NR==5 {print; next}
+  NR==6 {print; next}
+  NR==7 {print; next}
+  /sailpoi+/ {print $0}
+  /docker/ {print $0}
+'
+}
+
 
 ### END FUNCTIONS ###
 
@@ -645,16 +725,22 @@ fi
 echo $DIVIDER | tee -a "$LOGFILE"
 echo "$(date -u) - STARTING TESTS for $ORGNAME on $PODNAME"
 echo $DIVIDER
-echo "*** STARTING TESTS ***" >> "$LOGFILE"
-echo "Date:        $(date -u)" >> "$LOGFILE"
-echo "Stunt ver.:  $VERSION" >> "$LOGFILE"
-echo "Org:         $ORGNAME" >> "$LOGFILE"
-echo "Pod:         $PODNAME" >> "$LOGFILE"
-echo "Machine-id:  $MACHINE_ID" >> "$LOGFILE"
+echo "*** STARTING TESTS ***" | tee -a "$LOGFILE"
+echo "Date:           $(date -u)" | tee -a "$LOGFILE"
+echo "Stunt ver.:     $VERSION" | tee -a "$LOGFILE"
+echo "Org:            $ORGNAME" | tee -a "$LOGFILE"
+echo "Pod:            $PODNAME" | tee -a "$LOGFILE"
+echo "Machine-id:     $MACHINE_ID" | tee -a "$LOGFILE"
+echo "Canal enabled:  $IS_CANAL_ENABLED" | tee -a "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
 echo "<SUMMARY_BLOCK>" >> "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
 outro
+
+# Download TLS cert from IQService process
+if [[ $get_iqs_cert_process == true ]]; then
+  get_iqservice_cert
+fi
 
 # Forced update process
 
@@ -668,8 +754,8 @@ update_old_OS_with_new_charon() {
   if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version $version
   else 
-    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4152.2.0."
-    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4152.2.1
+    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4152.2.3."
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4152.2.3
   fi
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
   echo 0;
@@ -703,7 +789,7 @@ update_old_os() {
 }
 
 if [ "$do_update" == "true" ]; then
-  intro "Performing forced update - this process resets the machine-id and the update service. *A REBOOT IS REQUIRED WHEN SUCCESSFUL*"
+  intro "Performing forced update - this process resets the machine-id and the update service. *A REBOOT WILL BE REQUIRED*"
   read -p "Do you need to perform a machine-id reset? Y/n (choosing \"Y\" can force a reboot): " response
     case $response in
       [Yy])
@@ -726,7 +812,7 @@ if [ "$do_update" == "true" ]; then
   update_old_os
 
   if [[ $(grep "UPDATE_STATUS_REPORTING_ERROR_EVENT" $LOGFILE | wc -l) -gt 0 ]]; then
-    echo "Found UPDATE_STATUS_REPORTING_ERROR_EVENT during update; shunting update-engine logs to stuntlog"
+    echo "Found UPDATE_STATUS_REPORTING_ERROR_EVENT during update; shunting update-engine logs to stuntlog" | tee -a "$LOGFILE"
     intro "journalctl update-engine for last 2 hours"
     sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE"
   fi
@@ -775,92 +861,6 @@ if [ "$curl_test" == "true" ]; then
   exit 0
 fi
 
-# Reset <id>.json file - only use when moving a VA to a new cluster due to error "OpenSSL::PKey::RSAError: Neither PUB key nor PRIV key: bad decrypt" in charon.log
-if [[ "$reset_id_json" == "true" ]]; then
-  intro "Resetting the <id>.json file at /opt/sailpoint/share/chef/data_bags/aws_credentials/"
-  id_json_filepath="/opt/sailpoint/share/chef/data_bags/aws_credentials"
-  id_json_filename=$(ls $id_json_filepath)
-  original_md5=$(md5sum $id_json_filepath/$id_json_filename)
-  ellipsis=("." ".." "...")
-  ellipsis_index=0
-  expect "the file at $id_json_filepath/$id_json_filename to be deleted and a new copy generated."
-  while true; do
-    echo "$YELLOW*** Do not perform this operation if this VA was paired with a code generated by va-bootstrap. *** $RESETCOLOR"
-    echo "$YELLOW*** Use the 'va-bootstrap' script again instead. *** $RESETCOLOR"
-    read -p "Type 'Y' (caps only) to confirm file delete for $id_json_filepath/$id_json_filename: " response
-    case $response in
-      [Y])
-        echo "User accepted delete for $id_json_filepath/$id_json_filename by pressing Y" >> "$LOGFILE"
-        echo "Accepted delete. Continuing..."
-        sudo systemctl stop charon va_agent &&
-        sudo rm -f $id_json_filepath/$id_json_filename
-        if [ -f $id_json_filepath/$id_json_filename ]; then
-          echo "File still exists. Delete failed. Exiting" | tee -a "$LOGFILE"
-          exit 1
-        else
-          echo "File deleted successfully." >> "$LOGFILE"
-          echo "File deleted successfully. Please create a new VA record in your cluster, and copy the new"
-          echo "config.yaml onto this VA instance. I will wait to continue until you tell me this is complete by"
-          read -p "pressing 'Y' (caps only) again: " new_response
-          case $new_response in
-            [Y])
-              echo "User stated 2nd step in reset complete (new config.yaml in place) by pressing Y" >> "$LOGFILE"
-              echo "Continuing..."
-              sudo systemctl start va_agent
-              while [ ! "$(find "$id_json_filepath" -maxdepth 1 -type f -name "*.json")" ]; do
-                echo -n "Waiting for .json file to be generated${ellipsis[ellipsis_index]}"
-                ellipsis_index=$(( (ellipsis_index + 1) % ${#ellipsis[@]} ))
-                sleep 1
-                echo -ne "\r"
-              done
-              new_file=$(find "$id_json_filepath" -maxdepth 1 -type f -name "*.json")
-              echo "File generated @ $new_file!" | tee -a "$LOGFILE"
-              echo "Restarting services"
-              sudo systemctl start charon 2>&1 | tee -a "$LOGFILE" || echo "Failed to start charon" | tee -a "$LOGFILE"
-              sudo systemctl restart falcon >> "$LOGFILE" 2>&1 || echo "Failed to restart falcon" >> "$LOGFILE"
-              sudo systemctl restart canal >> "$LOGFILE" 2>&1 || echo "Failed to restart canal" >> "$LOGFILE"
-              sudo systemctl restart ccg >> "$LOGFILE" 2>&1 || echo "Failed to restart ccg" >> "$LOGFILE"
-              sudo systemctl restart otel_agent >> "$LOGFILE" 2>&1 || echo "Failed to restart otel_agent" >> "$LOGFILE"
-              ;;
-            *)
-              "Invalid input - exiting."
-              exit 1
-              ;;
-          esac
-        fi
-        echo "Steps complete. Please test the VA connection in the new cluster."
-        exit 0
-        break
-        ;;
-      *) #anything else
-        echo "Invalid input - exiting."
-        exit 1
-        ;;
-      esac
-  done
-  endscript
-fi
-
-determine_hosting() { #TODO - test unreliable
-  host_return_string="undetermined. All attempts to gather metadata were unsuccessful."
-  # check if EC2
-  if curl -s -L --connect-timeout 2 http://169.254.169.254/latest/meta-data/ > /dev/null; then
-    echo host_return_string="Amazon EC2"
-  elif curl -s -L -H "Metadata-Flavor: Google" --connect-timeout 2 http://169.254.169.254/ > /dev/null; then
-    echo host_return_string="Google Cloud"
-  elif curl -s -L -H Metadata:true --connect-timeout 2 "http://169.254.169.254/metadata/instance?api-version=2021-01-01" > /dev/null; then
-    echo host_return_string="Microsoft Azure"
-  else
-    echo $host_return_string
-  fi
-}
-
-# detect Canal in config.yaml
-if [[ $(cat /home/sailpoint/config.yaml | grep "^[[:space:]]*tunnelTraffic: true" | wc -l) -gt 0 ]]; then
-  IS_CANAL_ENABLED=true
-  intro "NOTE: CANAL CONFIG DETECTED"
-fi
-
 ### EXECUTE TESTS ###
 
 intro "Retrieving list of files in home directory with ls -alh"
@@ -876,7 +876,7 @@ key_passphrase_length=$(get_keyPassphrase_length)
 
 intro "Retrieving config.yaml contents"
 if [[ $key_passphrase_length -lt 1 ]]; then
-  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENECRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
+  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENCRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 else
   cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: '\?\"\?:::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 fi
@@ -887,13 +887,6 @@ if [[ $key_passphrase_length -lt 1 ]]; then
   echo -e "     ${YELLOW}ACTION$RESETCOLOR: Check validity of config.yaml; keyPassphrase may still be unencrypted"
 fi
 outro
-perform_test "Is keyPassphrase length less than 70 characters?" "get_keyPassphrase_length" -lt 70 -gt 69 "configuration"
-if [[ $key_passphrase_length -gt 69 ]]; then
-  echo -e "Current keyPassphrase length: $key_passphrase_length chars" >> "$LOGFILE"
-  echo -e "     ${YELLOW}ACTION$RESETCOLOR: If this cluster has not had any sources added recently, and no new network "
-  echo -e "     connectivity issues have been noted or reported, you can likely ignore this failure."
-fi 
-outro 
 
 intro "Retrieving history of commands run on this session"
 history >> "$LOGFILE"
@@ -903,9 +896,16 @@ intro "Retrieving list of sudo commands run from journalctl"
 sudo journalctl --no-pager _COMM=sudo  | grep -v -e "pam_unix(sudo:session)" >> "$LOGFILE"
 outro
 
-intro "This machine's IP address is: $IPADDR. If public, VA is much less likely to be able to communicate with an internal DNS"
-perform_test "Is IP address ($IPADDR) private?" "is_ip_private $IPADDR" -eq 0 -eq 1 "networking"
-echo "IP Address: $IPADDR" >> "$LOGFILE"
+intro "This machine's IP address is: $IPADDR."
+ip_result=$(is_ip_private $IPADDR)
+if [[ $ip_result == 1 ]]; then
+  echo -e "${YELLOW}WARNING:${RESETCOLOR} This IP address appears to be public. It may have difficulty communicating with an internal DNS"
+  echo -e "and may also be exposed to the public Internet - ${YELLOW}SailPoint recommends against exposing VAs to the edge of your network.{$RESETCOLOR}"
+  add_test_result "networking" "Error handler" "warn" "$1"
+  ((warnings++))
+else
+  perform_test "Is IP address ($IPADDR) private?" "is_ip_private $IPADDR" -eq 0 -eq 1 "networking"
+fi
 outro
 
 perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
@@ -916,7 +916,7 @@ outro
 ntp_result=$(ntp_sync)
 perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
-  echo -e "     {$YELLOW}ACTION: $RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
+  echo -e "     {$YELLOW}ACTION REQUIRED:${RESETCOLOR} Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
   echo -e "     https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server" | tee -a "$LOGFILE"
 fi
 outro
@@ -1003,16 +1003,31 @@ echo "OS version on this system: $RUNNING_FLATCAR_VERSION" >> "$LOGFILE"
 echo "Stable OS version on Flatcar site: $scraped_flatcar_version" >> "$LOGFILE"
 outro
 
+intro "Checking if there's a Flatcar OS update waiting to be installed"
+update_engine_status=$(get_update_engine_status)
+if [[ $(echo $update_engine_status | grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" ) ]]; then
+  echo -e "${CYAN}INFO$RESETCOLOR: An OS update is waiting; please reboot."
+  ADD_REBOOT_MESSAGE=true
+else
+  echo -e "${CYAN}INFO$RESETCOLOR: Current update-engine status: $update_engine_status"
+fi
+outro
+
 perform_test "The OS version must not be 2345.x.y." "detect_old_os_version" -eq 0 -eq 1 "system"
 
 intro "Retrieving CPU information"
 expect "the number of CPU(s) to be >= 2 CPUs. This is from AWS m4.large specs."
+perform_test "Is number of CPUs greater than or equal to 2?" "get_lscpu_num_cpus" ">" 1 "<" 2 "config"
 lscpu >> "$LOGFILE"
 outro
 
 intro "Retrieving total RAM"
 expect "the RAM to be >= 16Gi (approx 16GB). This is from AWS m4.large specs."
 free -h >> "$LOGFILE"
+outro
+
+intro "Retrieving current process list with 'top'"
+get_top_output >> "$LOGFILE"
 outro
 
 intro "Network list for all adapters"
@@ -1025,11 +1040,9 @@ outro
 
 intro "Network information for main adapter"
 expect "information from resolv.conf/static.network/etc. to match up with what you find for the main adapter"
-if [[ $(networkctl list | grep ens160) == *"ens160"* ]]; then
-  networkctl status ens160 >> "$LOGFILE" 2>&1
-else
-  networkctl status eth0 >> "$LOGFILE" 2>&1
-fi
+adapter_name=$(get_network_adapter_name)
+echo "Network adapter name: $adapter_name" >> "$LOGFILE"
+networkctl status $adapter_name >> "$LOGFILE"
 outro
 
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
@@ -1192,12 +1205,10 @@ if [[ $IS_IAI_VA == true ]]; then
   outro
 fi
 
-# FedRAMP doesn't currently support new VA pairing method, so skip when the org is FedRAMP
-if [[ $IS_ORG_FEDRAMP == false ]]; then
-  intro "External connectivity: Connection test to the va-activation endpoint to get a code"
-  { curl -vvv -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" 2>&1 || true; } >> "$LOGFILE"
-  outro
-fi
+#v2.3.8 - FedRAMP supports updated VA pairing
+intro "External connectivity: Connection test to the va-activation endpoint to get a code"
+  curl -vvv -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" 2>&1 || true; >> "$LOGFILE"
+outro
 
 intro "External connectivity: Connection test for SQS (https://sqs.$AWS_REGION.amazonaws.com)"
 curl -Ssv -i -L -vv --connect-timeout $seconds_between_tests "https://sqs.$AWS_REGION.amazonaws.com" >> "$LOGFILE" 2>&1
@@ -1205,10 +1216,11 @@ outro
 perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://sqs.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
+#Correct bug in grep - 
 intro "External connectivity: Connection test for https://$ORGNAME.$ISC_DOMAIN"
 curl -Ssv -i --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
 outro
-perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -E 'HTTP/2 302 | HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
+perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -e 'HTTP/2 302\|HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
 outro
 
 if [[ $IS_ORG_FEDRAMP == true ]]; then
@@ -1311,7 +1323,7 @@ fi
 outro
 
 expect "the CCG image to be updated: it should be less than 1 month old."
-docker_images=$(sudo docker images | sort)
+docker_images=$(echo "$DOCKER_IMAGES_OUTPUT" | sort)
 echo -e "$docker_images" >> "$LOGFILE"
 if echo -e "$docker_images" | grep -q "sailpoint/charon"; then
   : # charon is present
@@ -1337,7 +1349,7 @@ perform_test "Is va (fluent) running?" "check_container_running \"fluent\"" "=="
 outro
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
-  perform_test "Is canal running?" "sudo docker ps | grep canal | wc -l" -eq 1 -lt 1 "system"
+  perform_test "Is canal running?" "echo \"$DOCKER_PS_OUTPUT\" | grep canal | wc -l" -eq 1 -lt 1 "system"
   outro
 fi
 
@@ -1380,23 +1392,23 @@ expect "the subset to contain up-to-date version information for containers requ
 cat /opt/sailpoint/share/service-config.json | jq .dependencies >> "$LOGFILE"
 outro
 
-# intro "Attempting to determine the hardware host of this VA"
-# host_string=$(determine_hosting)
-# echo "Hosting solution is $host_string" | tee -a "$LOGFILE"
-# outro
-
-intro "If this system is hosted as a Hyper-V VM imported from the Azure VHD, disable waagent."
-if [[ $host_string == "Microsoft Azure" ]]; then
-  if [ "$do_fixup" == true ]; then
-    echo "Disabling waagent..."
-    sudo systemctl disable waagent | tee -a "$LOGFILE"
-  else
-    echo "System is probably hosted on MS Azure and fixup is disabled. Rerun script with fixup (-f) to attempt repair." | tee -a "$LOGFILE"
-  fi
-else
-  echo "Azure host not detected; no action required." | tee -a "$LOGFILE"
+if [ "$IS_ORG_FEDRAMP" = true ]; then
+  intro "'fips' string should exist in grub.cfg"
+  perform_test "Does the 'fips' string exist in the grub.cfg file?" "grep fips /oem/grub.cfg | wc -l" -eq 1 -lt 1 "system"
+  outro
 fi
+
+#CS0371557
+intro "Determine virtualization"
+virt_host=$(systemd-detect-virt)
+echo -e "Virtualization host is $virt_host." | tee -a "$LOGFILE"
 outro
+
+if [[ $(systemd-detect-virt) == "microsoft" ]]; then
+  intro "Azure-hosted VAs must have the waagent service masked, not just disabled."
+  perform_test "Is waagent masked?" "sudo systemctl status waagent | grep "masked" | wc -l" -eq 1 -lt 1 "system"
+  outro
+fi
 
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   intro "Retrieving systemd service configuration file: canal"
@@ -1603,25 +1615,6 @@ outro
 
 endscript
 
-if [ "$gather_logs" == true ]; then
-  # Get list of files in log directory just in case we need more than these specific files
-  intro "Gathering log files and ccg directory and zipping."
-  echo
-  echo "*** NOTE: This file might be large depending on the life of your VA. ***"
-  echo
-  if [ "$capture_journal" == true ]; then
-    echo "*** Gathering last day of systemd journal ***"
-    sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/journal-$(date +%Y%m%d%H%M).log
-  fi
-   zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR
-   echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
-  if [ "$capture_journal" == true ]; then
-    echo "*** Removing temporary systemd journal log ***"
-    rm /home/sailpoint/journal-*.log
-  fi
-  outro
-fi
-
 all_test_results=$(output_all_tests_by_category)
 
 echo $DIVIDER | tee -a "$LOGFILE"
@@ -1643,29 +1636,51 @@ $all_test_results"
 
 # CS0360919
 echo "$summary" > /tmp/summary_temp.txt
-awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync
-rm /tmp/summary_temp.txt
+awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync && rm /tmp/summary_temp.txt
+
+if [ "$gather_logs" == true ]; then
+  # Get list of files in log directory just in case we need more than these specific files
+  intro "Gathering log files and ccg directory and zipping."
+  echo
+  echo "*** NOTE: This file might be large depending on the life of your VA. ***"
+  echo
+  if [ "$capture_journal" == true ]; then
+    echo "*** Gathering last day of systemd journal ***"
+    sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/log/journal-$(date +%Y-%m-%d_%H:%M:%S).log && sync
+  fi
+  sync && zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR
+  echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
+  if [ "$capture_journal" == true ]; then
+    echo "*** Removing temporary systemd journal log ***"
+    rm /home/sailpoint/log/journal-*.log
+  fi
+  outro
+fi
 
 if [ "$gather_logs" == true ]; then
   echo
-  echo "*** RETRIEVE THE ZIPPED FILE WITHOUT RENAMING:"
-  echo "*** ${ZIPFILE} "
-  echo "*** AND UPLOAD TO YOUR CASE."
+  echo -e $REDBOLDUL"*** Retrieve this zipped file, without renaming, and upload to your case:"
+  echo -e $GREEN"${ZIPFILE} "
   echo
-  echo "We recommend use of the scp tool from a Linux/Mac/PuTTY shell to retrieve the zip file from"
+  echo -e $YELLOW"We recommend use of 'scp' from a Linux/Mac/PuTTY shell to retrieve the zip file from"
   echo "this server. Use the line created for you below at your local machine's terminal:"
-  echo -e $CYAN
-  echo -e "scp sailpoint@$IPADDR:$ZIPFILE ./ $RESETCOLOR"
+  echo 
+  echo -e $CYAN"scp sailpoint@$IPADDR:$ZIPFILE ./ $RESETCOLOR"
 else
   echo
   echo "*** RETRIEVE THE FILE WITHOUT RENAMING:"
   echo "*** ${LOGFILE} "
   echo "*** AND UPLOAD TO YOUR CASE."
+  echo 
+  echo -e $REDBOLDUL$DIVIDER
+  echo -e $GREEN"File created: $LOGFILE"
+  echo "Retrieve it and attach it to your case"
+  echo -e $REDBOLDUL$DIVIDER
+  echo 
+  echo -e $YELLOW"We recommend use of 'scp' from a Linux/Mac/PuTTY shell to retrieve the log file from"
+  echo -e "this server. Use the line created for you below at your local machine's terminal:"
   echo
-  echo "We recommend use of the scp tool from a Linux/Mac/PuTTY shell to retrieve the zip file from"
-  echo "this server. Use the line created for you below at your local machine's terminal:"
-  echo -e $CYAN
-  echo -e "scp sailpoint@$IPADDR:$LOGFILE ./ $RESETCOLOR"
+  echo -e $CYAN"scp sailpoint@$IPADDR:$LOGFILE ./ $RESETCOLOR"
 fi
 
 if [ "$ADD_REBOOT_MESSAGE" == true ]; then
