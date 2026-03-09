@@ -1,6 +1,7 @@
 #!/bin/bash
 
 #constants
+VERSION="v2.4.0"
 CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
@@ -78,6 +79,12 @@ else
 fi
 
 ### INIT ###
+if [[ $(sudo systemctl status canal | grep enabled | wc -l) -gt 0 ]]; then
+  IS_CANAL_ENABLED=true
+else
+  IS_CANAL_ENABLED=false
+fi
+
 if [[ -e "$CONFIG_YAML_FILE_PATH" ]]; then
   # Set global vars whose data come from config.yaml
   CONFIG_YAML=$(< $CONFIG_YAML_FILE_PATH )
@@ -85,12 +92,8 @@ if [[ -e "$CONFIG_YAML_FILE_PATH" ]]; then
   ORGNAME="${ORGNAME//$'\r'/}"                                #remove return characters
   PODNAME=$( echo "$CONFIG_YAML" | grep -oP '(?<=pod: ).*' )
   PODNAME="${PODNAME//$'\r'/}"                                #remove return characters
-  # detect Canal in config.yaml
-  if [[ $(echo $CONFIG_YAML | grep "^[[:space:]]*tunnelTraffic: true" | wc -l) -gt 0 ]]; then
-    IS_CANAL_ENABLED=true
-  else
-    IS_CANAL_ENABLED=false
-  fi
+  # detect Canal in systemd
+  #https://app.asana.com/1/40019095804142/project/1212671613187404/task/1212991215552901?focus=true
 else
   echo "*** Config file not found. "
   echo "*** Would you like to create a temporary config.yaml so stunt can run?"
@@ -119,11 +122,9 @@ fi
 
 ### GLOBAL RUNTIME VARIABLES ###
 
-VERSION="v2.3.8"
 DATE=$(date -u +"%b_%d_%y-%H_%M")
 DIVIDER="================================================================================"
-ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip
-LOGFILE=/home/sailpoint/stuntlog-$ORGNAME-$IPADDR.txt
+ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip. 
 LISTOFLOGS="/home/sailpoint/log/*.log"
 CCGDIR="/home/sailpoint/ccg/"
 RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
@@ -139,6 +140,8 @@ ISC_ACCESS="accessiq.sailpoint.com"
 JAVA_OVERWRITES_FILE_PATH="/home/sailpoint/ccg/java_overwrites.yaml"
 IS_CCG_RUNNING=false
 IS_IAI_VA=$(echo "$CONFIG_YAML" | grep -iq "iai:" && echo true || echo false)
+LOGFILE=/home/sailpoint/stuntlog-$ORGNAME-$IPADDR.log
+gather_logs=true
 
 # Get main partition name - CS0334359
 if [[ $(findmnt -nro SOURCE / ) ]]; then
@@ -159,6 +162,19 @@ if [[ $PODNAME == *"$FEDRAMP_STRING"* ]]; then
   AWS_REGION="us-gov-west-1"
   ISC_DOMAIN="saas.sailpointfedramp.com"
   ISC_ACCESS="idn.sailpointfedramp.com"
+fi
+
+# identitynow-demo.com compatibility - CS0390503
+IS_ORG_DEMO=false
+DEMO_STRING1="-poc"
+DEMO_STRING2="partner"
+DEMO_STRING3="training"
+DEMO_STRING4="company"
+if [[ ($PODNAME == *"$DEMO_STRING1"*) || ($PODNAME == *"$DEMO_STRING2"*) || ($PODNAME == *"$DEMO_STRING3"*) || ($PODNAME == *"$DEMO_STRING4"*) ]]; then
+  IS_ORG_DEMO=true
+  AWS_REGION="us-east-1"
+  ISC_DOMAIN="identitynow-demo.com"
+  ISC_ACCESS="accessiq.identitynow-demo.com"
 fi
 
 # for test pass/warn/fail and summary
@@ -186,22 +202,23 @@ help () {
   echo "VA, and places that data into a stuntlog text file in your home directory."
   echo "Collecting this helps SailPoint Support Engineers troubleshoot your system."
   echo
-  echo "Syntax: ./stunt.sh [-h] [-t,p,f,o,s,l/L,j|u|c]"
+  echo "Syntax: ./stunt.sh [-h] [ -t,p,f,o,s,j,l/L  OR  n|u|c ]"
   echo "Options:"
   echo "h   Print this help info then exit"
   echo "t   Add traceroute test to SQS"
   echo "p   Add ping test"
   echo "f   Add automatic fixup steps"
   echo "o   Add openssl config file into stuntlog"
-  echo "s   Pulls a server-based certificate from the IQService server and installs it in /home/sailpoint/certificates/"
-  echo "l/L Add collection of log files and archive them along with stuntlog file."
-  echo "j   Add collection of the last day of the systemd journal (requires -l/-L)"
-  echo "u   Only perform forced OS update (this will make system changes) then exit"
-  echo "c   Only perform a curl test that connects to SQS and S3, one test every four seconds for three minutes then exit"
+  echo "s   Pulls a server-based certificate from a server and installs it in /home/sailpoint/certificates/"
+  echo "l/L Add zip collection of log files and archive them along with stuntlog file (Default)"
+  echo "j   Add to zip collection of the last day of the systemd journal"
+  echo "n   [exclusive] Do not collect archive of log files; this overrides zip file collection"
+  echo "u   [exclusive] Only perform forced OS update (this will make system changes) then exit"
+  echo "c   [exclusive] Only perform a curl test that connects to SQS and S3, one test every four seconds for three minutes then exit"
 }
 
 # Get cmd line args
-while getopts ":htpfoslLjucr" option; do
+while getopts ":htpfoslLjnucr" option; do
   case $option in
     h) #display help
       help
@@ -219,10 +236,11 @@ while getopts ":htpfoslLjucr" option; do
     l)
       gather_logs=true;;
     L)
-      gather_logs=true
-      LOGFILE=/home/sailpoint/stuntlog-$ORGNAME-$IPADDR.log;;
+      gather_logs=true;;
     j)
       capture_journal=true;;
+    n)
+      gather_logs=false;;
     u)
       do_update=true;;
     c)
@@ -316,27 +334,27 @@ perform_test() {
 
   if [ "$pass_comparison_operator" = "==" ] && [ "$output" = "$pass_expected_condition" ]; then
     echo -e "PASS: $test_name" >> "$LOGFILE"
-    echo -e "$GREEN PASS$RESETCOLOR: $test_name"
+    echo -e "${GREEN}PASS$RESETCOLOR: $test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" = "==" ] && [ "$output" = "$fail_expected_condition" ]; then
     echo -e "FAIL: $test_name" >> "$LOGFILE"
-    echo -e "{$RED}FAIL$RESETCOLOR: $test_name"
+    echo -e "${RED}FAIL$RESETCOLOR: $test_name"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   elif [ "$pass_comparison_operator" != "==" ] && [ "$output" "$pass_comparison_operator" "$pass_expected_condition" ]; then
     echo -e "PASS: $test_name" >> "$LOGFILE"
-    echo -e "{$GREEN}PASS$RESETCOLOR: $test_name"
+    echo -e "${GREEN}PASS$RESETCOLOR: $test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" != "==" ] && [ "$output" "$fail_comparison_operator" "$fail_expected_condition" ]; then
     echo -e "FAIL: $test_name" >> "$LOGFILE"
-    echo -e "{$RED}FAIL$RESETCOLOR: $test_name"
+    echo -e "${RED}FAIL$RESETCOLOR: $test_name"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   else
     echo -e "WARNING: $test_name" >> "$LOGFILE"
-    echo -e "{$YELLOW}WARNING$RESETCOLOR: $test_name"
+    echo -e "${YELLOW}WARNING$RESETCOLOR: $test_name"
     ((warnings++))
     add_test_result "$test_category" "$test_name" "warn" "$output"
   fi
@@ -369,7 +387,7 @@ handle_error() {
   intro "Script encountered an error with the following command: ${BASH_COMMAND}."
   echo "The stuntlog file at $LOGFILE contains an error due to the exception. Continuing... "
   echo -e "Test $test_name: WARNING" >> "$LOGFILE"
-  echo -e "Test $test_name: {$YELLOW}WARNING $RESETCOLOR"
+  echo -e "Test $test_name:${YELLOW} WARNING $RESETCOLOR"
   add_test_result "script" "Error handler" "warn" "$1"
   ((warnings++))
   outro
@@ -423,21 +441,25 @@ cert_tester() {
 
   # Loop through each certificate file in the directory
   for cert_file in "$CERT_DIRECTORY"/*; do
+    expired_certs=()
     if [ -f "$cert_file" ]; then
       # Check if the file is in PEM format using the 'openssl' command
       if openssl x509 -in "$cert_file" -noout -text &>/dev/null; then
         # Certificate is valid (in PEM format)
-        add_test_result "certificates" "Cert test: $cert_file" "pass" ""
+        add_test_result "certificates" "Cert test: $cert_file" "pass" "Certificates"
         ((passes++))
+        if ! openssl x509 -checkend 0 -noout -in "$cert_file"; then
+          expired_certs+=("$cert_file")
+        fi
       else
         # Certificate is not in PEM format
-        add_test_result "certificates" "Cert test: $cert_file" "fail" ""
+        add_test_result "certificates" "Cert test: $cert_file" "fail" "Certificates"
         failed_certs+=("$(basename "$cert_file")")
         ((failures++))
       fi
     else
       echo "Skipped: $cert_file (Unknown file type)"
-      add_test_result "certificates" "Cert test: $cert_file" "warn" ""
+      add_test_result "certificates" "Cert test: $cert_file" "warn" "Certificates"
       failed_certs+=("$(basename "$cert_file")")
       ((warnings++))
     fi
@@ -446,8 +468,32 @@ cert_tester() {
   if [[ $failures > $starting_failures ]]; then
     echo "Failed or skipped certificates:"
     for cert_name in "${failed_certs[@]}"; do
-      echo -e "Test -$RED FAIL$RESETCOLOR: $cert_name"
+      echo -e "Test - $RED FAIL$RESETCOLOR: $cert_name"
     done
+  fi
+
+  if [ ! ${#expired_certs[@]} -eq 0 ]; then
+    echo "Expired certificates: " | tee -a "$LOGFILE"
+    for i in "${!expired_certs[@]}"; do
+      echo "$((i + 1)). ${expired_certs[i]}"
+    done
+    if [[ "$do_fixup" == true ]]; then
+      read -p "Delete expired certs? (Y/N): " choice
+      if [[ "$choice" =~ ^[Yy]$ ]]; then
+        echo "Choice read in: $choice" | tee -a "$LOGFILE"
+        for cert in "${expired_certs[@]}"; do
+          rm "$cert"
+          echo "Deleted $cert" | tee -a "$LOGFILE"
+        done
+      else
+        echo "No certificates deleted." | tee -a "$LOGFILE"  
+      fi
+    else
+      echo
+      echo -e "${YELLOW}WARNING:$RESETCOLOR Expired/expiring certificates found, but not deleted." | tee -a "$LOGFILE"
+      echo -e "${YELLOW}ACTION:$RESETCOLOR Re-run stunt with -f to delete expired certificate files." | tee -a "$LOGFILE"
+      echo
+    fi
   fi
 }
 
@@ -460,7 +506,7 @@ canalenv_exists() {
       echo "Creating canal.env"
       touch /home/sailpoint/canal.env
     else
-      echo -e "{$YELLOW}ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup "
+      echo -e "${YELLOW}ACTION:$RESETCOLOR File does not exist, but the option for automatic fixup "
       echo -e "is not enabled. Rerun STUNT with -f to create the canal.env file"
     fi
     echo 1
@@ -476,7 +522,7 @@ canal_log_contains_FNF_string() {
       echo "Creating canal-hc.log" | tee -a "$LOGFILE"
       touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
     else
-      echo -e "{$YELLOW}ACTION: $RESETCOLOR 'No such file or directory' error found in canal-hc.log," | tee -a "$LOGFILE"
+      echo -e "${YELLOW}ACTION: $RESETCOLOR 'No such file or directory' error found in canal-hc.log," | tee -a "$LOGFILE"
       echo -e "but the option for automatic fixup is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
     fi
     echo 1
@@ -515,7 +561,7 @@ detect_old_os_version() {
       update_old_os
       echo 0
     else
-      echo -e "{$YELLOW}ACTION: $RESETCOLOR Old OS detected, but fixup flag is not enabled." | tee -a "$LOGFILE"
+      echo -e "${YELLOW}ACTION:$RESETCOLOR Old OS detected, but fixup flag is not enabled." | tee -a "$LOGFILE"
       echo -e "Rerun STUNT with -f to attempt the automatic update process." | tee -a "$LOGFILE"
       echo 1
     fi
@@ -535,8 +581,7 @@ get_flatcar_current_version() { #"https://www.flatcar.org/releases"
 }
 
 get_update_engine_status() {
-  UPDATE_ENGINE_STATUS_TEXT=$(sudo update_engine_client -status 2>/dev/null | awk -F '=' '/^CURRENT_OP/ { print $2 }')
-  echo $UPDATE_ENGINE_STATUS_TEXT
+  timeout 2 sudo update_engine_client -status
 }
 
 # CS0245929
@@ -590,8 +635,8 @@ fix_missing_images() {
 }
 
 test_openssh_version () {
-  required_major_version=9
-  required_minor_version=8 # require v9.7 or above
+  required_major_version=10
+  required_minor_version=0 # require v10.0 or above
   openssh_version_output=$(ssh -V 2>&1)
   openssh_version=$(echo "$openssh_version_output" | grep -oP '(?<=OpenSSH_)[0-9]+\.[0-9]+')
   openssh_major_version=$(echo $openssh_version | cut -d '.' -f 1)
@@ -619,10 +664,11 @@ canal_connection_test () {
   echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat $1 443 | head -c 5 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m;
 }
 
-#CS0371476
+#CS0371476 - test string:
+# "100.80.9.9|localhost|*.googleapis.com|*.db.com|*.internal|*.mybad.io|169.254.169.254|10.216.204.118|127.0.0.1|100.80.99.244"
 check_no_proxy_validate_format() {
   local value=$(awk -F': ' '/^no_proxy:/ {print $2}' "$PROXY_FILE_PATH")
-  if [[ ! "$value" =~ ^\"?[a-zA-Z0-9|.]+\"?$ ]]; then
+  if [[ ! "$value" =~ ^\"?[a-zA-Z0-9|*.]+\"?$ ]]; then
     echo 1
     return
   fi
@@ -633,6 +679,10 @@ check_no_proxy_validate_format() {
 
 get_lscpu_num_cpus () {
   lscpu | grep -i ^CPU\(s | awk '{print $2}'
+}
+
+get_free_total_mem_in_gb () {
+  free -h | grep "Mem:" | awk -F' ' '{print $2}' | sed 's/Gi//' | xargs printf "%.0f" 
 }
 
 get_network_adapter_name () {
@@ -649,18 +699,21 @@ get_iqservice_cert () {
     read -p "Enter the IP address or hostname of the IQService server: " iqservice_network_address
     read -p "Enter the TLS port for the IQService (usually 5050 or 5051): " iqservice_secure_port
     local cert_filepath="/home/sailpoint/certificates/${iqservice_network_address}.cer"
-    openssl s_client -connect $iqservice_network_address:$iqservice_secure_port 2>/dev/null | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > $cert_filepath &&  
-      sudo systemctl restart ccg && 
-      sync
+    timeout 7 openssl s_client -connect $iqservice_network_address:$iqservice_secure_port >&2 | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > $cert_filepath;
+    sync
 
-    if test -f $cert_filepath ; then                                                     # if new cert exists,
-      if [ $(stat -c%s $cert_filepath) -gt 0 ]; then                                     # and it isn't empty
-        echo -e "${GREEN}SUCCESS ${RESETCOLOR}- Certificate was added at $cert_filepath" # then success
+    if test -f $cert_filepath ; then                                                                          # if new cert exists,
+      if [ $(stat -c%s $cert_filepath) -gt 0 ]; then                                                          # and it isn't empty
+        echo -e "${GREEN}SUCCESS ${RESETCOLOR}- Certificate was added at $cert_filepath" | tee -a "$LOGFILE"  # then success
+        sudo systemctl restart ccg
+        echo
       else
-        echo -e "${YELLOW}WARN ${RESETCOLOR}- New certificate file is blank; check your server string and port information, then try again."
+        echo -e "${YELLOW}WARN ${RESETCOLOR}- New certificate file is blank; check your server string and port information, then try again." | tee -a "$LOGFILE"
+        echo -e "- This is usually due to a timeout with no immediate response from the server. Errors may or may not be shown."
       fi
     else
-      echo -e "${RED}FAIL ${RESETCOLOR}- The file for ${cert_filepath} was not found - check your server string and port information, then try again."
+      echo -e "${RED}FAIL ${RESETCOLOR}- The file for ${cert_filepath} was not found - check your server string and port information, then try again." | tee -a "$LOGFILE"
+      echo -e "-"
       endscript
       exit 1
     fi
@@ -720,18 +773,24 @@ else
   touch $LOGFILE
 fi
 
+#CS0371557
+virt_host=$(systemd-detect-virt)
+
 # CS0363009
 # Start the tests by placing a header in the logfile
 echo $DIVIDER | tee -a "$LOGFILE"
 echo "$(date -u) - STARTING TESTS for $ORGNAME on $PODNAME"
 echo $DIVIDER
 echo "*** STARTING TESTS ***" | tee -a "$LOGFILE"
-echo "Date:           $(date -u)" | tee -a "$LOGFILE"
-echo "Stunt ver.:     $VERSION" | tee -a "$LOGFILE"
-echo "Org:            $ORGNAME" | tee -a "$LOGFILE"
-echo "Pod:            $PODNAME" | tee -a "$LOGFILE"
-echo "Machine-id:     $MACHINE_ID" | tee -a "$LOGFILE"
-echo "Canal enabled:  $IS_CANAL_ENABLED" | tee -a "$LOGFILE"
+echo "Date:                 $(date -u)" | tee -a "$LOGFILE"
+echo "Stunt ver.:           $VERSION" | tee -a "$LOGFILE"
+echo "Org:                  $ORGNAME" | tee -a "$LOGFILE"
+echo "Pod:                  $PODNAME" | tee -a "$LOGFILE"
+echo "IP Address:           $IPADDR" | tee -a "$LOGFILE"
+echo "Machine-id:           $MACHINE_ID" | tee -a "$LOGFILE"
+echo "Canal enabled:        $IS_CANAL_ENABLED" | tee -a "$LOGFILE"
+echo "Virtualization host:  $virt_host" | tee -a "$LOGFILE"
+echo "Flags used for stunt: $1" | tee -a "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
 echo "<SUMMARY_BLOCK>" >> "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
@@ -754,11 +813,26 @@ update_old_OS_with_new_charon() {
   if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version $version
   else 
-    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4152.2.3."
-    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4152.2.3
+    echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to gather version information from flatcar website; trying with default OS version value of 4459.2.0."
+    sudo /opt/sailpoint/share/bin/flatcar-update -Q --to-version 4459.2.0
   fi
   sudo rm /etc/systemd/system/update-engine.service.d/override.conf
   echo 0;
+}
+
+reset_machine_id() {
+  local MACHINE_ID="$(cat /etc/machine-id)"
+  echo "Old ID: $MACHINE_ID"
+  sudo rm -f /etc/machine-id  >> "$LOGFILE" 2>&1
+  sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
+  local new_machine_id=$(cat /etc/machine-id)
+  echo "New ID: $new_machine_id"
+  if [[ $MACHINE_ID == $new_machine_id ]]; then
+    echo "Old and new IDs match; interrupting update process and forcing a reboot" | tee -a "$LOGFILE"
+    sleep 5
+    endscript
+    sudo rm -f /etc/machine-id && sudo reboot
+  fi
 }
 
 update_old_os() {
@@ -793,30 +867,22 @@ if [ "$do_update" == "true" ]; then
   read -p "Do you need to perform a machine-id reset? Y/n (choosing \"Y\" can force a reboot): " response
     case $response in
       [Yy])
-        echo "Old ID: $MACHINE_ID"
-        sudo rm -f /etc/machine-id  >> "$LOGFILE" 2>&1
-        sudo systemd-machine-id-setup  >> "$LOGFILE" 2>&1
-        new_machine_id=$(cat /etc/machine-id)
-        echo "New ID: $new_machine_id"
-        if [[ $MACHINE_ID == $new_machine_id ]]; then
-          echo "Old and new IDs match; interrupting update process and forcing a reboot" | tee -a "$LOGFILE"
-          sleep 5
-          endscript
-          sudo rm -f /etc/machine-id && sudo reboot
-        fi
+        reset_machine_id
         ;;
       *)
       ;;
     esac
-
   update_old_os
-
   if [[ $(grep "UPDATE_STATUS_REPORTING_ERROR_EVENT" $LOGFILE | wc -l) -gt 0 ]]; then
     echo "Found UPDATE_STATUS_REPORTING_ERROR_EVENT during update; shunting update-engine logs to stuntlog" | tee -a "$LOGFILE"
     intro "journalctl update-engine for last 2 hours"
     sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE"
   fi
-  # TODO - If this detects "NO_UPDATE_AVAILABLE", we should remove the machine id again, set it up again, and do the double-update (last line)
+  if [[ $(grep "NO_UPDATE_AVAILABLE" $LOGFILE | wc -l) -gt 0 ]]; then
+    echo "Found NO_UPDATE_AVAILABLE during update; Resetting machine-id again and doing double-update" | tee -a "$LOGFILE"
+    reset_machine_id
+    update_old_os
+  fi
   outro
   endscript
   echo "EXITING"
@@ -899,8 +965,8 @@ outro
 intro "This machine's IP address is: $IPADDR."
 ip_result=$(is_ip_private $IPADDR)
 if [[ $ip_result == 1 ]]; then
-  echo -e "${YELLOW}WARNING:${RESETCOLOR} This IP address appears to be public. It may have difficulty communicating with an internal DNS"
-  echo -e "and may also be exposed to the public Internet - ${YELLOW}SailPoint recommends against exposing VAs to the edge of your network.{$RESETCOLOR}"
+  echo -e "${YELLOW}WARNING:$RESETCOLOR This IP address appears to be public. It may have difficulty communicating with an internal DNS"
+  echo -e "and may also be exposed to the public Internet - ${YELLOW}SailPoint recommends against exposing VAs to the edge of your network.$RESETCOLOR"
   add_test_result "networking" "Error handler" "warn" "$1"
   ((warnings++))
 else
@@ -916,9 +982,13 @@ outro
 ntp_result=$(ntp_sync)
 perform_test "Does timedatectl show NTP time is synced?" "ntp_sync" -eq 0 -ne 0 "configuration"
 if [[ $ntp_result != 0 ]]; then
-  echo -e "     {$YELLOW}ACTION REQUIRED:${RESETCOLOR} Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
+  echo -e "     ${YELLOW}ACTION REQUIRED:$RESETCOLOR Test for NTP sync failed. To configure NTP, see the following link: " | tee -a "$LOGFILE"
   echo -e "     https://documentation.sailpoint.com/saas/help/va/requirements_va.html#connecting-the-va-to-a-local-ntp-server" | tee -a "$LOGFILE"
 fi
+outro
+
+intro "Retrieving OS reboot history"
+last reboot >> "$LOGFILE"
 outro
 
 intro "Retrieving OS Uptime"
@@ -939,8 +1009,24 @@ elif test -f /home/sailpoint/log/ccg-start.log; then
 elif test -f /home/sailpoint/log/ccg.log; then
   echo "Grep in ccg.log: $(grep -iE 'OpenJDK_64-Bit_Server_VM' /home/sailpoint/log/ccg.log | awk -F'OpenJDK_64-Bit_Server_VM' '{if (NF>1) {match($2, /[0-9]+\.[0-9]+\.[0-9]+/, version); if (version[0] != "") print version[0]}}' | tail -n1)" >> "$LOGFILE"
 else
-  echo -e "{$YELLOW}WARNING: $RESETCOLOR Unable to find any log files to grep!"
+  echo -e "${YELLOW}WARNING:$RESETCOLOR Unable to find any log files to grep!"
 fi
+outro
+
+intro "Checking for ip.list and retrieving contents of file"
+if test -f /home/sailpoint/ip.list; then
+  cat /home/sailpoint/ip.list >> "$LOGFILE"
+elif [[ "$do_fixup" == true ]]; then
+  echo -e "${CYAN}INFO:$RESETCOLOR Resetting IP information in /home/sailpoint/ip.list file, then restarting services..."
+  $(ip addr show label 'e[a-z][a-z][0-9]*' | grep -Po 'inet[6]* \K[\w.:]+' > /home/sailpoint/ip.list && sudo systemctl restart va_agent && sudo systemctl restart charon)
+else
+  echo -e "${YELLOW}WARNING:$RESETCOLOR ip.list file is missing. See KB article: https://sailpoint.service-now.com/kb?id=kb_article_view&sysparm_article=KB0019278" 
+fi
+
+intro "Checking for existence of files in /opt/sailpoint/share/"
+perform_test "Does /opt/sailpoint/share/bin/ contain va-bootstrap?" "if [ -f \"/opt/sailpoint/share/bin/va-bootstrap\" ]; then echo 0; else echo 1; fi" -eq 0 -ge 1 "system"
+perform_test "Does /opt/sailpoint/share/data/ contain a cluster_key.p12 file?" "if [ -f \"/opt/sailpoint/share/data/cluster_key.p12\" ]; then echo 0; else echo 1; fi" -eq 0 -ge 1 "system"
+perform_test "Does /opt/sailpoint/share/ contain a ./jobs/ directory?" "if [ -d /opt/sailpoint/share/jobs/ ]; then echo 0; else echo 1; fi" -eq 0 -ge 1 "system"
 outro
 
 if test -f /etc/profile.env; then
@@ -1004,25 +1090,33 @@ echo "Stable OS version on Flatcar site: $scraped_flatcar_version" >> "$LOGFILE"
 outro
 
 intro "Checking if there's a Flatcar OS update waiting to be installed"
-update_engine_status=$(get_update_engine_status)
+update_engine_status=$(get_update_engine_status 2>&1)
+if [ $? -ne 0 ]; then             # the command get_update_engine_status_call timed out, so restart the service and try again
+  sudo systemctl restart update-engine
+  status_text=$(get_update_engine_status 2>&1)
+fi
 if [[ $(echo $update_engine_status | grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" ) ]]; then
-  echo -e "${CYAN}INFO$RESETCOLOR: An OS update is waiting; please reboot."
+  echo -e "${CYAN}INFO$RESETCOLOR: An OS update is waiting; please reboot." | tee -a $LOGFILE
   ADD_REBOOT_MESSAGE=true
 else
-  echo -e "${CYAN}INFO$RESETCOLOR: Current update-engine status: $update_engine_status"
+  echo -e "${CYAN}INFO$RESETCOLOR: Current update-engine status: $update_engine_status" | tee -a $LOGFILE
 fi
 outro
 
+intro "Testing OS version"
 perform_test "The OS version must not be 2345.x.y." "detect_old_os_version" -eq 0 -eq 1 "system"
+outro
+
 
 intro "Retrieving CPU information"
-expect "the number of CPU(s) to be >= 2 CPUs. This is from AWS m4.large specs."
-perform_test "Is number of CPUs greater than or equal to 2?" "get_lscpu_num_cpus" ">" 1 "<" 2 "config"
+expect "the number of CPU(s) to be >= 4 CPUs. This is from AWS m4.large specs."
+perform_test "Is number of CPUs greater than or equal to 2?" "get_lscpu_num_cpus" ">" 1 "<" 2 "system"
 lscpu >> "$LOGFILE"
 outro
 
 intro "Retrieving total RAM"
-expect "the RAM to be >= 16Gi (approx 16GB). This is from AWS m4.large specs."
+expect "the RAM to be >= 15Gi (approx 16GB). This is from AWS m4.large specs."
+perform_test "Is amount of RAM at least 16GB?" "get_free_total_mem_in_gb" -ge 15 -lt 15 "system"
 free -h >> "$LOGFILE"
 outro
 
@@ -1156,10 +1250,10 @@ intro "Checking for the existence of override.conf"
 expect "this file not to exist"
 if [[ -e /etc/systemd/system/update-engine.service.d/override.conf ]]; then
   if [[ "$do_fixup" == true ]]; then
-    echo -e "${INFO}INFO$RESETCOLOR: override.conf found and fixup enabled. Attempting removal..." | tee -a "$LOGFILE"
+    echo -e "${INFO}INFO:$RESETCOLOR override.conf found and fixup enabled. Attempting removal..." | tee -a "$LOGFILE"
     sudo rm /etc/systemd/system/update-engine.service.d/override.conf | tee -a "$LOGFILE"
   fi
-  echo -e "${YELLOW}ACTION: {$RESETCOLOR}override.conf file found, but fixup option is not enabled. Rerun script with fixup (-f) to remove this file." | tee -a "$LOGFILE"
+  echo -e "${YELLOW}ACTION:$RESETCOLOR override.conf file found, but fixup option is not enabled. Rerun script with fixup (-f) to remove this file." | tee -a "$LOGFILE"
 else
   echo "File not found, as expected" | tee -a "$LOGFILE"
 fi
@@ -1206,8 +1300,8 @@ if [[ $IS_IAI_VA == true ]]; then
 fi
 
 #v2.3.8 - FedRAMP supports updated VA pairing
-intro "External connectivity: Connection test to the va-activation endpoint to get a code"
-  curl -vvv -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" 2>&1 || true; >> "$LOGFILE"
+intro "External connectivity: Connection test to the va-activation endpoint to get a code (blank response is ok)"
+curl -Svv -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" >> "$LOGFILE" 2>&1 || true
 outro
 
 intro "External connectivity: Connection test for SQS (https://sqs.$AWS_REGION.amazonaws.com)"
@@ -1216,8 +1310,7 @@ outro
 perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://sqs.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
-#Correct bug in grep - 
-intro "External connectivity: Connection test for https://$ORGNAME.$ISC_DOMAIN"
+intro "External connectivity: Connection test for main URL (expected failure on vanity) https://$ORGNAME.$ISC_DOMAIN"
 curl -Ssv -i --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
 outro
 perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -e 'HTTP/2 302\|HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
@@ -1268,7 +1361,7 @@ sudo netstat -st >> "$LOGFILE" 2>&1
 outro
 
 intro "Performing OpenSSH version test"
-perform_test "Check output from 'ssh -V', and expect it to be 9.6 or higher" "test_openssh_version" -eq 0 -ne 0 "networking"
+perform_test "Output from 'ssh -V' is $openssh_version; expect it to be 10.0 or higher" "test_openssh_version" -eq 0 -ne 0 "networking"
 outro 
 
 intro "Retrieving information on how system is using DNS for each link"
@@ -1291,7 +1384,7 @@ intro "Retrieving additional routing information from ip route show"
 ip route show >> "$LOGFILE"
 outro
 
-# Only gather log snippets if we're not getting all logs via -l switch
+# Only gather log snippets if we're not getting all logs due to -n flag
 if [[ "$gather_logs" != true ]]; then
   intro "Retrieving ccg.log errors - latest 30 errors"
   expect "recent datestamps. Some logs might be old and no longer pertinent. Expect no keystore.jks or 'decrypter' errors. These signify a keyPassphrase issue."
@@ -1300,7 +1393,8 @@ fi
 
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
-current_charon=$(get_current_image_tag charon) #CS0334845
+current_charon=$(get_current_image_tag charon) #CS0334845  if [[ 1 == 1 ]]; then echo true; fi
+perform_test "Is charon version higher than $CHARON_MINIMUM_VERSION?" "if [[ $current_charon > $CHARON_MINIMUM_VERSION ]]; then echo true; fi" "==" "true" "==" "false" "system"
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
 if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
@@ -1349,12 +1443,20 @@ perform_test "Is va (fluent) running?" "check_container_running \"fluent\"" "=="
 outro
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
-  perform_test "Is canal running?" "echo \"$DOCKER_PS_OUTPUT\" | grep canal | wc -l" -eq 1 -lt 1 "system"
+  perform_test "Is canal running?" "check_container_running \"canal\"" "==" "true" "==" "false" "system"
   outro
 fi
 
 intro "Retrieving ccg container configuration from /proc/meminfo"
 sudo docker exec ccg ls /proc/meminfo | xargs cat >> "$LOGFILE"
+outro
+
+intro "Retrieving list of running systemd services"
+systemctl list-units --type=service --state=running >> "$LOGFILE"
+outro
+
+intro "Retrieving list of exited systemd services"
+systemctl list-units --type=service --state=exited >> "$LOGFILE"
 outro
 
 intro "Retrieving systemd service configuration file: charon"
@@ -1398,13 +1500,7 @@ if [ "$IS_ORG_FEDRAMP" = true ]; then
   outro
 fi
 
-#CS0371557
-intro "Determine virtualization"
-virt_host=$(systemd-detect-virt)
-echo -e "Virtualization host is $virt_host." | tee -a "$LOGFILE"
-outro
-
-if [[ $(systemd-detect-virt) == "microsoft" ]]; then
+if [[ "$virt_host" == "microsoft" ]]; then
   intro "Azure-hosted VAs must have the waagent service masked, not just disabled."
   perform_test "Is waagent masked?" "sudo systemctl status waagent | grep "masked" | wc -l" -eq 1 -lt 1 "system"
   outro
@@ -1458,7 +1554,7 @@ outro
 
 intro "Retrieving list of large files"
 expect "most files to be less than 1MB. Log files can be significantly larger, but shouldn't exceed 1GB each."
-find /home/sailpoint/ -xdev -type f -size +100M -print | xargs ls -lh | sort -k5,5 -h -r >> "$LOGFILE"
+find ~/log/ -xdev -type f -size +100M | xargs ls -lh | sort -k5,5 -h -r >> "$LOGFILE"
 outro
 
 perform_test "Are more than 100 inodes available on the main partition?" "(df -i | awk -v partition=\"$MAIN_PARTITION\" '\$1 == partition {print \$4}' | tail -n1)" -gt 100 -lt 100 "system" 
@@ -1496,7 +1592,7 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
       echo "Creating canal-hc.log" | tee -a "$LOGFILE"
       touch /home/sailpoint/log/canal-hc.log | tee -a "$LOGFILE"
     else
-      echo -e "{$YELLOW}ACTION: $RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
+      echo -e "${YELLOW}ACTION:$RESETCOLOR File does not exist, but the option for automatic fixup" | tee -a "$LOGFILE"
       echo -e "is not enabled. Rerun STUNT with -f to create the canal-hc.log file" | tee -a "$LOGFILE"
     fi
   fi
@@ -1520,11 +1616,11 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
   echo
 fi
 
-intro "Gathering logrotate service info"
+intro "Gathering logrotate service info (/usr/lib/systemd/system/logrotate.service)"
 cat /usr/lib/systemd/system/logrotate.service >> "$LOGFILE"
 outro
 
-intro "Gathering logrotate configuration info"
+intro "Gathering logrotate configuration info (/usr/share/logrotate/logrotate.conf)"
 cat /usr/share/logrotate/logrotate.conf >> "$LOGFILE"
 outro
 
@@ -1539,6 +1635,10 @@ else
 fi
 outro
 
+intro "Testing for decrypter errors in ccg.log"
+perform_test "Check ccg.log for indicators of mismatched keyPassphrase" 'tail --bytes 10M /home/sailpoint/log/ccg.log | grep -i "An error occurred while decrypting the message" | wc -l' "==" "0" ">=" "0" "configuration"
+outro
+
 intro "Retrieving last 25 lines of error logs from dmesg"
 expect "this to be blank. Any kernel ring buffer or hv_netvsc (Hyper-V specific) messages likely reveal hardware-related errors."
 dmesg | grep -i "error" | tail -n25 >> "$LOGFILE"
@@ -1551,7 +1651,7 @@ if [ $? -gt 0 ] && [ -e /home/sailpoint/log/ccg.log.1 ]; then
     echo "Found corrupted logrotate cache. Attempting fixup." >> "$LOGFILE"
     echo "-----" >> /home/sailpoint/log/ccg.log.1 && sudo systemctl start logrotate.service
   else 
-    echo -e "{$YELLOW}ACTION: $RESETCOLOR 'No such file or directory' error found in logrotate.service journal logs," | tee -a "$LOGFILE"
+    echo -e "${YELLOW}ACTION: $RESETCOLOR 'No such file or directory' error found in logrotate.service journal logs," | tee -a "$LOGFILE"
     echo -e "but the option for automatic fixup is not enabled. Rerun STUNT with -f to attempt automatic correction." | tee -a "$LOGFILE"
   fi
 fi
@@ -1579,15 +1679,15 @@ outro
 
 # CS0360097
 intro "Retrieving last 2 hours of update-service (update-engine) journal logs"
-sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE" 
+sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE" && sync
 if grep -q "Unknown Omaha response status: error-internal" "$LOGFILE"; then
-  echo -e "{$YELLOW}WARNING: {$RESETCOLOR} Found 'Unknown Omaha response status: error-internal'"
+  echo -e "${YELLOW}WARNING:$RESETCOLOR Found 'Unknown Omaha response status: error-internal'"
   echo "This indicates a machine-id conflict between this instance and the update server."
   if [[ "$do_fixup" == true ]]; then
     echo "Removing the machine-id automatically. A REBOOT IS REQUIRED."
     sudo rm -f /etc/machine-id && ADD_REBOOT_MESSAGE=true
   else
-    echo -e "{$YELLOW}ACTION: $RESETCOLOR The machine-id must be reset, but the option for automatic fixup "
+    echo -e "${YELLOW}ACTION:$RESETCOLOR The machine-id must be reset, but the option for automatic fixup "
     echo "is not enabled. Re-run stunt with the '-f' flag."
   fi
 fi
@@ -1609,7 +1709,7 @@ intro "Retrieving all dockerd journal logs from the last week"
 sudo journalctl --no-pager -S "1 week ago" | grep dockerd >> "$LOGFILE"
 outro
 
-intro "Retrieving the last full hour of journal logs"
+intro "Retrieving the last 1 hour of journal logs"
 sudo journalctl --no-pager -S "1 hour ago" >> "$LOGFILE"
 outro
 
@@ -1638,32 +1738,42 @@ $all_test_results"
 echo "$summary" > /tmp/summary_temp.txt
 awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync && rm /tmp/summary_temp.txt
 
-if [ "$gather_logs" == true ]; then
-  # Get list of files in log directory just in case we need more than these specific files
-  intro "Gathering log files and ccg directory and zipping."
+if [ "$capture_journal" != true ] && [ "$gather_logs" == true ]; then
+  # archive stuntlog, all logs in /home/sailpoint/log/ and config files in /home/sailpoint/ccg/
+  intro "Gathering log files and ccg directory and zipping. 3"
   echo
-  echo "*** NOTE: This file might be large depending on the life of your VA. ***"
+  echo "*** NOTE: This file might be large depending on the lifespan and uptime of your VA. ***"
   echo
-  if [ "$capture_journal" == true ]; then
-    echo "*** Gathering last day of systemd journal ***"
-    sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/log/journal-$(date +%Y-%m-%d_%H:%M:%S).log && sync
-  fi
-  sync && zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR
-  echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
-  if [ "$capture_journal" == true ]; then
-    echo "*** Removing temporary systemd journal log ***"
-    rm /home/sailpoint/log/journal-*.log
-  fi
-  outro
+  zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR
 fi
+if [ "$gather_logs" != true ] && [ "$capture_journal" == true ]; then
+  # archive stuntlog and journal log
+  echo "*** Gathering last 24hrs of systemd journal and archiving ***"
+  sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/log/journal-$(date +%Y-%m-%d_%H:%M:%S).log && sync
+  zip -r $ZIPFILE $LOGFILE /home/sailpoint/log/journal-* &&
+  echo "*** Removing temporary systemd journal log *1*"
+  rm /home/sailpoint/log/journal-*.log
+fi
+if [ "$gather_logs" == true ] && [ "$capture_journal" == true ]; then
+  # archive stuntlog, journald log, all logs in /home/sailpoint/log/ and config files in /home/sailpoint/ccg/
+  echo "*** Gathering last 24hrs of systemd journal, all log files, ccg directory, and archiving ***"
+  sudo journalctl --no-pager -S "1 day ago" > /home/sailpoint/log/journal-$(date +%Y-%m-%d_%H:%M:%S).log && sync
+  zip -r $ZIPFILE $LOGFILE $LISTOFLOGS $CCGDIR &&
+  echo "*** Removing temporary systemd journal log *2*"
+  rm /home/sailpoint/log/journal-*.log
+fi
+outro
 
-if [ "$gather_logs" == true ]; then
+if [ "$gather_logs" == true ] ; then #|| ([ "$gather_logs" == true && "$capture_journal" == true ])
+  echo "Zipped to $ZIPFILE" | tee -a "$LOGFILE"
+  # Remove the stuntlog file now that it's in the zip
+  rm $LOGFILE
   echo
   echo -e $REDBOLDUL"*** Retrieve this zipped file, without renaming, and upload to your case:"
   echo -e $GREEN"${ZIPFILE} "
   echo
-  echo -e $YELLOW"We recommend use of 'scp' from a Linux/Mac/PuTTY shell to retrieve the zip file from"
-  echo "this server. Use the line created for you below at your local machine's terminal:"
+  echo -e $YELLOW"EXIT the VA, and use 'scp' from a shell/terminal to retrieve the zip file from this server."
+  echo "Use the line created for you below at your local machine's shell/terminal:"
   echo 
   echo -e $CYAN"scp sailpoint@$IPADDR:$ZIPFILE ./ $RESETCOLOR"
 else
@@ -1677,8 +1787,8 @@ else
   echo "Retrieve it and attach it to your case"
   echo -e $REDBOLDUL$DIVIDER
   echo 
-  echo -e $YELLOW"We recommend use of 'scp' from a Linux/Mac/PuTTY shell to retrieve the log file from"
-  echo -e "this server. Use the line created for you below at your local machine's terminal:"
+  echo -e $YELLOW"EXIT the VA and use 'scp' from a shell/terminal to retrieve the log file from this server."
+  echo -e "Use the line created for you below at your local machine's shell/terminal:"
   echo
   echo -e $CYAN"scp sailpoint@$IPADDR:$LOGFILE ./ $RESETCOLOR"
 fi
