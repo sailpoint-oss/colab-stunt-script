@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #constants
-VERSION="v2.4.0"
+VERSION="v2.4.1"
 CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
@@ -106,7 +106,7 @@ else
       ORGNAME="mytestorg"
       PODNAME="stg01-useast1"
       touch $CONFIG_YAML_FILE_PATH && 
-      echo -e "pod: $PODNAME\norg: $ORGNAME\napiUser: \"testapiuser\"\napiKey: \"testapikey\"\nkeyPassphrase: \"::::testkeypassphrase\"" > $CONFIG_YAML_FILE_PATH
+      echo -e "pod: $PODNAME\norg: $ORGNAME\napiUser: \"testapiuser\"\napiKey: \"::!:A2:testapikey\"\nkeyPassphrase: \"::!:A2:testkeypassphrase\"" > $CONFIG_YAML_FILE_PATH
       if [-f $CONFIG_YAML_FILE_PATH ]; then
         echo "File generated successfully."
       else 
@@ -292,7 +292,7 @@ endscript() {
 }
 
 get_keyPassphrase_length() {
-  cat $CONFIG_YAML_FILE_PATH | grep -E "keyPassphrase: ['\"]::::" | sed -E "s/keyPassphrase: ['\"]//g" | sed -E "s/['\"]$//gm" | wc -m # Will return 0 if unencrypted
+  cat $CONFIG_YAML_FILE_PATH | grep -E "keyPassphrase: '[^:]*:[^:]*[^']*'" | sed -E "s/keyPassphrase: ['\"]//g" | sed -E "s/['\"]$//gm" | wc -m # Will return 0 if unencrypted
 }
 
 get_num_share_jobs() {
@@ -942,9 +942,9 @@ key_passphrase_length=$(get_keyPassphrase_length)
 
 intro "Retrieving config.yaml contents"
 if [[ $key_passphrase_length -lt 1 ]]; then
-  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENCRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
+  cat /home/sailpoint/config.yaml | sed -E "s/keyPassphrase: .*/keyPassphrase: <REMAINS UNENCRYPTED>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 else
-  cat /home/sailpoint/config.yaml | sed "s/keyPassphrase: '\?\"\?:::.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
+  cat /home/sailpoint/config.yaml | sed -E "s/keyPassphrase: '[^:]*:[^:]*[^']*'.*/keyPassphrase: <redacted>/g" | sed "s/apiKey: .*/apiKey: <redacted>/g" >> "$LOGFILE"
 fi
 outro
 
