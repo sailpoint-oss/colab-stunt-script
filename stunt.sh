@@ -10,12 +10,14 @@ MACHINE_ID="$(cat /etc/machine-id)"
 IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}')
 DOCKER_PS_OUTPUT=$(sudo docker ps -s)
 DOCKER_IMAGES_OUTPUT=$(sudo docker images)
+STUNTOPTS=$1
 
 # colors for output
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
+INFO='\033[1;37m' #bold white
 REDBOLDUL='\033[31;1;4m'
 RESETCOLOR='\033[0m'
 
@@ -396,8 +398,6 @@ handle_error() {
 trap handle_interrupts SIGINT
 trap 'handle_error "$BASH_COMMAND"' ERR
 
-
-#CS0237900
 is_ip_private() {
   local private_ranges=(
     "10.0.0.0/8"
@@ -513,9 +513,8 @@ canalenv_exists() {
   fi
 }
 
-# CS0268465
 canal_log_contains_FNF_string() {
-  if [[ $(cat /home/sailpoint/canal-hc.log | grep "No such file or directory" | wc -l) -lt 1 ]]; then
+  if [[ $(cat /home/sailpoint/log/canal-hc.log | grep "No such file or directory" | wc -l) -lt 1 ]]; then
     echo 0
   else
     if [[ "$do_fixup" == true ]]; then
@@ -549,14 +548,13 @@ get_charon_network_test_line() {
   grep -a 'Networking check' "/home/sailpoint/log/charon.log" | tail -1
 }
 
-#CS0254079
 detect_old_os_version() {
   #look in $RUNNING_FLATCAR_VERSION for major version 2345 or lower
   major_version=$( echo "$RUNNING_FLATCAR_VERSION" | awk -F'.' '{ print $1 }' )
   if [[ $major_version -le 2345 ]]; then
     echo "Major version is $major_version, and requires update." | tee -a "$LOGFILE"
     if [[ "$do_fixup" == true ]]; then
-      echo -e "${CYAN}INFO$RESETCOLOR: Since -f flag was used, we'll attempt to update automatically." | tee -a "$LOGFILE"
+      echo -e "${INFO}INFO$RESETCOLOR: Since -f flag was used, we'll attempt to update automatically." | tee -a "$LOGFILE"
       echo | tee -a "$LOGFILE"
       update_old_os
       echo 0
@@ -570,7 +568,6 @@ detect_old_os_version() {
   fi
 }
 
-# CS0268451
 get_flatcar_current_version() { #"https://www.flatcar.org/releases"
   if flatcar_html=$(curl -s -L --connect-timeout $seconds_between_tests $FLATCAR_STABLE_RELEASE_FILE 2>/dev/null); then
     FLATCAR_CURRENT_VER=$(curl -fsSL $FLATCAR_STABLE_RELEASE_FILE | grep FLATCAR_VERSION= | cut -d = -f 2)
@@ -584,7 +581,6 @@ get_update_engine_status() {
   timeout 2 sudo update_engine_client -status
 }
 
-# CS0245929
 no_proxy_double_quotes() {
   no_proxy_value=$(grep "^no_proxy:" "$PROXY_FILE_PATH" | awk -F': ' '{print $2}')
 
@@ -664,7 +660,7 @@ canal_connection_test () {
   echo -e '\x00\x0e\x38\xa3\xcf\xa4\x6b\x74\xf3\x12\x8a\x00\x00\x00\x00\x00' | ncat $1 443 | head -c 5 | cat -v | tr -d '[:space:]' | grep -e @^Z@ | wc -m;
 }
 
-#CS0371476 - test string:
+#test string:
 # "100.80.9.9|localhost|*.googleapis.com|*.db.com|*.internal|*.mybad.io|169.254.169.254|10.216.204.118|127.0.0.1|100.80.99.244"
 check_no_proxy_validate_format() {
   local value=$(awk -F': ' '/^no_proxy:/ {print $2}' "$PROXY_FILE_PATH")
@@ -689,7 +685,6 @@ get_network_adapter_name () {
   ip -o link show | awk -F': ' '/state UP/ && $2 != "lo" {print $2; exit}'
 }
 
-#CS0390746
 get_iqservice_cert () {
   local iqservice_network_address
   local iqservice_secure_port
@@ -733,7 +728,6 @@ get_iqservice_cert () {
   exit 0
 }
 
-#CS0380481
 get_top_output() {
   top -b -n 1 | awk '
   BEGIN {FS=" "}
@@ -773,10 +767,8 @@ else
   touch $LOGFILE
 fi
 
-#CS0371557
 virt_host=$(systemd-detect-virt)
 
-# CS0363009
 # Start the tests by placing a header in the logfile
 echo $DIVIDER | tee -a "$LOGFILE"
 echo "$(date -u) - STARTING TESTS for $ORGNAME on $PODNAME"
@@ -790,7 +782,7 @@ echo "IP Address:           $IPADDR" | tee -a "$LOGFILE"
 echo "Machine-id:           $MACHINE_ID" | tee -a "$LOGFILE"
 echo "Canal enabled:        $IS_CANAL_ENABLED" | tee -a "$LOGFILE"
 echo "Virtualization host:  $virt_host" | tee -a "$LOGFILE"
-echo "Flags used for stunt: $1" | tee -a "$LOGFILE"
+echo "Flags used for stunt: $STUNTOPTS" | tee -a "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
 echo "<SUMMARY_BLOCK>" >> "$LOGFILE"
 echo $DIVIDER >> "$LOGFILE"
@@ -1017,7 +1009,7 @@ intro "Checking for ip.list and retrieving contents of file"
 if test -f /home/sailpoint/ip.list; then
   cat /home/sailpoint/ip.list >> "$LOGFILE"
 elif [[ "$do_fixup" == true ]]; then
-  echo -e "${CYAN}INFO:$RESETCOLOR Resetting IP information in /home/sailpoint/ip.list file, then restarting services..."
+  echo -e "${INFO}INFO:$RESETCOLOR Resetting IP information in /home/sailpoint/ip.list file, then restarting services..."
   $(ip addr show label 'e[a-z][a-z][0-9]*' | grep -Po 'inet[6]* \K[\w.:]+' > /home/sailpoint/ip.list && sudo systemctl restart va_agent && sudo systemctl restart charon)
 else
   echo -e "${YELLOW}WARNING:$RESETCOLOR ip.list file is missing. See KB article: https://sailpoint.service-now.com/kb?id=kb_article_view&sysparm_article=KB0019278" 
@@ -1096,10 +1088,10 @@ if [ $? -ne 0 ]; then             # the command get_update_engine_status_call ti
   status_text=$(get_update_engine_status 2>&1)
 fi
 if [[ $(echo $update_engine_status | grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" ) ]]; then
-  echo -e "${CYAN}INFO$RESETCOLOR: An OS update is waiting; please reboot." | tee -a $LOGFILE
+  echo -e "${INFO}INFO$RESETCOLOR: An OS update is waiting; please reboot." | tee -a $LOGFILE
   ADD_REBOOT_MESSAGE=true
 else
-  echo -e "${CYAN}INFO$RESETCOLOR: Current update-engine status: $update_engine_status" | tee -a $LOGFILE
+  echo -e "${INFO}INFO$RESETCOLOR: Current update-engine status: $update_engine_status" | tee -a $LOGFILE
 fi
 outro
 
@@ -1202,7 +1194,7 @@ if [[ -e "/home/sailpoint/hosts.yaml" ]]; then
   cat /home/sailpoint/hosts.yaml >> "$LOGFILE"
 else
   echo "INFO - /home/sailpoint/hosts.yaml not found" >> "$LOGFILE"
-  echo -e "${CYAN}INFO$RESETCOLOR: hosts.yaml not found"
+  echo -e "${INFO}INFO$RESETCOLOR: hosts.yaml not found"
 fi
 outro
 
@@ -1393,7 +1385,7 @@ fi
 
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
-current_charon=$(get_current_image_tag charon) #CS0334845  if [[ 1 == 1 ]]; then echo true; fi
+current_charon=$(get_current_image_tag charon) 
 perform_test "Is charon version higher than $CHARON_MINIMUM_VERSION?" "if [[ $current_charon > $CHARON_MINIMUM_VERSION ]]; then echo true; fi" "==" "true" "==" "false" "system"
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
@@ -1627,7 +1619,7 @@ outro
 intro "Checking for modified ccg java heap settings"
 expect "file not found at location: $JAVA_OVERWRITES_FILE_PATH."
 if [[ -e  $JAVA_OVERWRITES_FILE_PATH ]]; then
-  echo -e "${CYAN}INFO:$RESETCOLOR Found java heap settings have been manually set. Please follow compatibility guidelines." | tee -a "$LOGFILE"
+  echo -e "${INFO}INFO:$RESETCOLOR Found java heap settings have been manually set. Please follow compatibility guidelines." | tee -a "$LOGFILE"
   echo -e "https://community.sailpoint.com/t5/IdentityNow-Draft-Documents/Increasing-memory-usage-on-the-VA-Java-heap/ta-p/78766"
   cat $JAVA_OVERWRITES_FILE_PATH >> "$LOGFILE"
 else
@@ -1636,7 +1628,7 @@ fi
 outro
 
 intro "Testing for decrypter errors in ccg.log"
-perform_test "Check ccg.log for indicators of mismatched keyPassphrase" 'tail --bytes 10M /home/sailpoint/log/ccg.log | grep -i "An error occurred while decrypting the message" | wc -l' "==" "0" ">=" "0" "configuration"
+perform_test "Check ccg.log for indicators of mismatched keyPassphrase" 'tail --bytes 10M /home/sailpoint/log/ccg.log | grep -i "An error occurred while decrypting the message" | wc -l' -eq 0 -gt 0 "configuration"
 outro
 
 intro "Retrieving last 25 lines of error logs from dmesg"
