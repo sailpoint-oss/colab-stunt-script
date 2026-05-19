@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #constants
-VERSION="v2.4.1"
+VERSION="v2.4.2"
 CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
@@ -294,7 +294,7 @@ endscript() {
 }
 
 get_keyPassphrase_length() {
-  cat $CONFIG_YAML_FILE_PATH | grep -E "keyPassphrase: '[^:]*:[^:]*[^']*'" | sed -E "s/keyPassphrase: ['\"]//g" | sed -E "s/['\"]$//gm" | wc -m # Will return 0 if unencrypted
+  cat $CONFIG_YAML_FILE_PATH | grep -E "keyPassphrase:\s*([\"'])([^\"']*)\1" | sed -E "s/keyPassphrase: ['\"]//g" | sed -E "s/['\"]$//gm" | wc -m # Will return 0 if unencrypted
 }
 
 get_num_share_jobs() {
@@ -594,7 +594,7 @@ no_proxy_double_quotes() {
 get_current_image_tag() {
   image_name="$1"
   current_image_id=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep current | head -n 1 | awk '{print $3}')
-  current_image_tag=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}')
+  current_image_tag=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}' | head -n 1)
   echo "$current_image_tag" | grep -o '^[[:digit:]]*'
 }
 
@@ -1102,7 +1102,7 @@ outro
 
 intro "Retrieving CPU information"
 expect "the number of CPU(s) to be >= 4 CPUs. This is from AWS m4.large specs."
-perform_test "Is number of CPUs greater than or equal to 2?" "get_lscpu_num_cpus" ">" 1 "<" 2 "system"
+perform_test "Is number of CPUs greater than or equal to 4?" "get_lscpu_num_cpus" ">" 3 "<" 4 "system"
 lscpu >> "$LOGFILE"
 outro
 
@@ -1302,18 +1302,20 @@ outro
 perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://sqs.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
 outro
 
-intro "External connectivity: Connection test for main URL (expected failure on vanity) https://$ORGNAME.$ISC_DOMAIN"
-curl -Ssv -i --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
-outro
-perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -e 'HTTP/2 302\|HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
-outro
+if [[ $ORGNAME != "mytestorg" ]]; then # Skip test when temporary config.yaml in place
+  intro "External connectivity: Connection test for main URL (expected failure on vanity) https://$ORGNAME.$ISC_DOMAIN"
+  curl -Ssv -i --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
+  outro
+  perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -e 'HTTP/2 302\|HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
+  outro
 
-if [[ $IS_ORG_FEDRAMP == true ]]; then
-  intro "External connectivity: Connection test for https://$ORGNAME.$ISC_ACCESS"
-  curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_ACCESS" >> "$LOGFILE" 2>&1
-  outro
-  perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_ACCESS\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
-  outro
+  if [[ $IS_ORG_FEDRAMP == true ]]; then
+    intro "External connectivity: Connection test for https://$ORGNAME.$ISC_ACCESS"
+    curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_ACCESS" >> "$LOGFILE" 2>&1
+    outro
+    perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_ACCESS\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
+    outro
+  fi
 fi
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.$AWS_REGION.amazonaws.com)"
@@ -1431,7 +1433,7 @@ perform_test "Is va_agent running?" "check_container_running \"va_agent\"" "==" 
 outro
 perform_test "Is charon running?" "check_container_running \"charon\"" "==" "true" "==" "false" "system"
 outro
-perform_test "Is va (fluent) running?" "check_container_running \"fluent\"" "==" "true" "==" "false" "system"
+perform_test "Are either fluent or vector running?" "check_container_running \"fluent\|vector\"" "==" "true" "==" "false" "system"
 outro
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
