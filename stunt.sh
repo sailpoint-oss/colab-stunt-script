@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #constants
-VERSION="v2.4.2"
+VERSION="v2.4.3"
 CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
@@ -129,7 +129,7 @@ DIVIDER="=======================================================================
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip. 
 LISTOFLOGS="/home/sailpoint/log/*.log"
 CCGDIR="/home/sailpoint/ccg/"
-RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
+RUNNING_FLATCAR_VERSION="$(grep -oP 'VERSION=\K[^<]*' /etc/os-release | tr -d '"')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
 FLATCAR_STABLE_RELEASE_FILE="https://stable.release.flatcar-linux.net/amd64-usr/current/version.txt"
 CERT_DIRECTORY="/home/sailpoint/certificates"
@@ -163,7 +163,7 @@ if [[ $PODNAME == *"$FEDRAMP_STRING"* ]]; then
   IS_ORG_FEDRAMP=true
   AWS_REGION="us-gov-west-1"
   ISC_DOMAIN="saas.sailpointfedramp.com"
-  ISC_ACCESS="idn.sailpointfedramp.com"
+  ISC_ACCESS="idn.sailpointfedramp.com" ## TODO - is this failing in fedramp?
 fi
 
 # identitynow-demo.com compatibility - CS0390503
@@ -185,6 +185,9 @@ passes=0
 failures=0
 warnings=0
 declare -A test_categories
+declare -a fail_summary_lines=()
+declare -a warn_summary_lines=()
+RESULT_SEP=$'\x1e' # record separator; avoids commas in test names breaking summaries
 summary=""
 output_document_summary="$summary"
 
@@ -259,8 +262,8 @@ done
 intro() {
   set -f #Disable globbing
   echo "$DIVIDER" >> "$LOGFILE"
-  echo "$1"
-  echo "$1" >> "$LOGFILE"
+  echo -e "${CYAN}>>${RESETCOLOR} $1"
+  echo ">> $1" >> "$LOGFILE"
   echo "$DIVIDER" >> "$LOGFILE"
   set +f
 }
@@ -304,17 +307,48 @@ get_num_workflow_jobs() {
   echo $(find "/opt/sailpoint/workflow/jobs" -maxdepth 1 -type f | wc -l)
 }
 
+# Print a single aligned PASS/FAIL/WARN line to stdout (colored) and logfile (plain).
+# Optional 3rd arg is an indented detail line (shown mainly for fail/warn).
+print_test_status() {
+  local status="$1"
+  local test_name="$2"
+  local detail="${3:-}"
+  local color="$RESETCOLOR"
+  local tag
+
+  case "$status" in
+    PASS) color="$GREEN";  tag="[ PASS ]" ;;
+    FAIL) color="$RED";    tag="[ FAIL ]" ;;
+    WARN) color="$YELLOW"; tag="[ WARN ]" ;;
+    *)    tag="[ ---- ]" ;;
+  esac
+
+  echo -e "${color}${tag}${RESETCOLOR} ${test_name}"
+  echo "${tag} ${test_name}" >> "$LOGFILE"
+
+  if [[ -n "$detail" ]]; then
+    echo -e "           ${detail}"
+    echo "           ${detail}" >> "$LOGFILE"
+  fi
+}
+
 add_test_result() {
   local category="$1"
   local test_name="$2"
   local test_result="$3"
   local test_output="$4"
+  local entry="${test_result}|${test_name}|${test_output}"
 
   if [[ -z "${test_categories[$category]}" ]]; then
-    test_categories["$category"]="$test_name: $test_result -- Test output: $test_output"
+    test_categories["$category"]="$entry"
   else
-    test_categories["$category"]="${test_categories["$category"]},$test_name: $test_result -- Test output: $test_output"
+    test_categories["$category"]="${test_categories["$category"]}${RESULT_SEP}${entry}"
   fi
+
+  case "$test_result" in
+    fail) fail_summary_lines+=("${test_name}|${test_output}") ;;
+    warn) warn_summary_lines+=("${test_name}|${test_output}") ;;
+  esac
 }
 
 # CS0237804
@@ -329,51 +363,124 @@ perform_test() {
   local fail_comparison_operator="$5"
   local fail_expected_condition="$6"
   local test_category="$7"
+  local detail=""
 
   output=$(eval "$test_command")
-
-  echo -e $DIVIDER
+  total_tests=$((total_tests + 1))
 
   if [ "$pass_comparison_operator" = "==" ] && [ "$output" = "$pass_expected_condition" ]; then
-    echo -e "PASS: $test_name" >> "$LOGFILE"
-    echo -e "${GREEN}PASS$RESETCOLOR: $test_name"
+    print_test_status "PASS" "$test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" = "==" ] && [ "$output" = "$fail_expected_condition" ]; then
-    echo -e "FAIL: $test_name" >> "$LOGFILE"
-    echo -e "${RED}FAIL$RESETCOLOR: $test_name"
+    detail="got: ${output}    expected: ${pass_comparison_operator} ${pass_expected_condition}"
+    print_test_status "FAIL" "$test_name" "$detail"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   elif [ "$pass_comparison_operator" != "==" ] && [ "$output" "$pass_comparison_operator" "$pass_expected_condition" ]; then
-    echo -e "PASS: $test_name" >> "$LOGFILE"
-    echo -e "${GREEN}PASS$RESETCOLOR: $test_name"
+    print_test_status "PASS" "$test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" != "==" ] && [ "$output" "$fail_comparison_operator" "$fail_expected_condition" ]; then
-    echo -e "FAIL: $test_name" >> "$LOGFILE"
-    echo -e "${RED}FAIL$RESETCOLOR: $test_name"
+    detail="got: ${output}    expected pass when: ${pass_comparison_operator} ${pass_expected_condition}"
+    print_test_status "FAIL" "$test_name" "$detail"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   else
-    echo -e "WARNING: $test_name" >> "$LOGFILE"
-    echo -e "${YELLOW}WARNING$RESETCOLOR: $test_name"
+    detail="got: ${output}    (did not match pass or fail criteria)"
+    print_test_status "WARN" "$test_name" "$detail"
     ((warnings++))
     add_test_result "$test_category" "$test_name" "warn" "$output"
   fi
+}
 
-  echo -e $DIVIDER
+format_status_tag() {
+  case "$1" in
+    pass) echo "[ PASS ]" ;;
+    fail) echo "[ FAIL ]" ;;
+    warn) echo "[ WARN ]" ;;
+    *)    echo "[ ---- ]" ;;
+  esac
 }
 
 output_all_tests_by_category() {
-  for category in "${!test_categories[@]}"; do
-    echo "Category: $category"
-    tests="${test_categories[$category]}"
-    IFS=',' read -ra test_results <<< "$tests"
+  local category tests entry status name out tag rest
+  # Stable category order for easier scanning
+  local ordered_categories=("system" "configuration" "networking" "certificates" "script")
+  local printed_categories=()
+  local -a entries=()
 
-    for test_result in "${test_results[@]}"; do
-      echo "  $test_result"
+  for category in "${ordered_categories[@]}" "${!test_categories[@]}"; do
+    # Skip missing / already printed categories
+    [[ -z "${test_categories[$category]+x}" ]] && continue
+    [[ " ${printed_categories[*]} " == *" $category "* ]] && continue
+    printed_categories+=("$category")
+
+    echo
+    echo "  Category: $category"
+    tests="${test_categories[$category]}"
+    entries=()
+    # Split on record separator into an array (avoids trailing-empty read quirks)
+    while IFS= read -r -d "$RESULT_SEP" entry; do
+      [[ -n "$entry" ]] && entries+=("$entry")
+    done < <(printf '%s%s' "$tests" "$RESULT_SEP")
+
+    for entry in "${entries[@]}"; do
+      status="${entry%%|*}"
+      rest="${entry#*|}"
+      name="${rest%%|*}"
+      out="${rest#*|}"
+      # If name equals out, there was no separate output field
+      if [[ "$name" == "$out" && "$rest" != *"|"* ]]; then
+        out=""
+      fi
+      tag=$(format_status_tag "$status")
+      printf "    %s %s\n" "$tag" "$name"
+      if [[ "$status" != "pass" && -n "$out" ]]; then
+        printf "             result: %s\n" "$out"
+      fi
     done
   done
+}
+
+print_testing_summary() {
+  local line name out
+  local thin_divider="--------------------------------------------------------------------------------"
+
+  echo "$DIVIDER"
+  echo "TEST SUMMARY"
+  echo "$DIVIDER"
+  echo -e "  Passed:   ${GREEN}${passes}${RESETCOLOR}"
+  echo -e "  Failed:   ${RED}${failures}${RESETCOLOR}"
+  echo -e "  Warnings: ${YELLOW}${warnings}${RESETCOLOR}"
+  echo -e "  Total:    ${total_tests}"
+  echo "$thin_divider"
+
+  if [[ ${#fail_summary_lines[@]} -gt 0 ]]; then
+    echo "FAILURES:"
+    for line in "${fail_summary_lines[@]}"; do
+      name="${line%%|*}"
+      out="${line#*|}"
+      echo -e "  ${RED}[ FAIL ]${RESETCOLOR} ${name}"
+      [[ -n "$out" ]] && echo "           result: ${out}"
+    done
+    echo "$thin_divider"
+  fi
+
+  if [[ ${#warn_summary_lines[@]} -gt 0 ]]; then
+    echo "WARNINGS:"
+    for line in "${warn_summary_lines[@]}"; do
+      name="${line%%|*}"
+      out="${line#*|}"
+      echo -e "  ${YELLOW}[ WARN ]${RESETCOLOR} ${name}"
+      [[ -n "$out" ]] && echo "           result: ${out}"
+    done
+    echo "$thin_divider"
+  fi
+
+  echo "ALL RESULTS BY CATEGORY:"
+  output_all_tests_by_category
+  echo "$DIVIDER"
 }
 
 # Handle exceptions
@@ -388,8 +495,7 @@ handle_error() {
   error_message="$1"
   intro "Script encountered an error with the following command: ${BASH_COMMAND}."
   echo "The stuntlog file at $LOGFILE contains an error due to the exception. Continuing... "
-  echo -e "Test $test_name: WARNING" >> "$LOGFILE"
-  echo -e "Test $test_name:${YELLOW} WARNING $RESETCOLOR"
+  print_test_status "WARN" "${test_name:-unknown test}" "error during: ${BASH_COMMAND}"
   add_test_result "script" "Error handler" "warn" "$1"
   ((warnings++))
   outro
@@ -468,7 +574,7 @@ cert_tester() {
   if [[ $failures > $starting_failures ]]; then
     echo "Failed or skipped certificates:"
     for cert_name in "${failed_certs[@]}"; do
-      echo -e "Test - $RED FAIL$RESETCOLOR: $cert_name"
+      print_test_status "FAIL" "$cert_name"
     done
   fi
 
@@ -694,7 +800,7 @@ get_iqservice_cert () {
     read -p "Enter the IP address or hostname of the IQService server: " iqservice_network_address
     read -p "Enter the TLS port for the IQService (usually 5050 or 5051): " iqservice_secure_port
     local cert_filepath="/home/sailpoint/certificates/${iqservice_network_address}.cer"
-    timeout 7 openssl s_client -connect $iqservice_network_address:$iqservice_secure_port >&2 | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > $cert_filepath;
+    timeout 7 openssl s_client -connect "$iqservice_network_address":"$iqservice_secure_port" >&2 | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > "$cert_filepath";
     sync
 
     if test -f $cert_filepath ; then                                                                          # if new cert exists,
@@ -946,6 +1052,10 @@ if [[ $key_passphrase_length -lt 1 ]]; then
 fi
 outro
 
+perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
+echo "uname output: $(uname -a)" >> "$LOGFILE"
+outro
+
 intro "Retrieving history of commands run on this session"
 history >> "$LOGFILE"
 outro
@@ -964,10 +1074,6 @@ if [[ $ip_result == 1 ]]; then
 else
   perform_test "Is IP address ($IPADDR) private?" "is_ip_private $IPADDR" -eq 0 -eq 1 "networking"
 fi
-outro
-
-perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
-echo "uname output: $(uname -a)" >> "$LOGFILE"
 outro
 
 # CS0239311 - If left unsynced, could result in excessive message processing times
@@ -1709,28 +1815,63 @@ outro
 
 endscript
 
+# Build a plain-text summary for the logfile (no ANSI colors)
 all_test_results=$(output_all_tests_by_category)
-
-echo $DIVIDER | tee -a "$LOGFILE"
-echo "Testing summary"
-echo $DIVIDER
-echo -e "Tests passed:                           $GREEN $passes $RESETCOLOR"
-echo -e "Tests failed:                           $RED $failures $RESETCOLOR"
-echo -e "Test warnings:                          $YELLOW $warnings $RESETCOLOR"
-echo
-echo $DIVIDER
-
 summary="*** Post test summary ***
-Tests passed:   $passes 
-Tests failed:    $failures 
-Test warnings:  $warnings 
+Passed:   $passes
+Failed:   $failures
+Warnings: $warnings
+Total:    $total_tests
+"
 
-Tests:
+if [[ ${#fail_summary_lines[@]} -gt 0 ]]; then
+  summary+="
+FAILURES:"
+  for line in "${fail_summary_lines[@]}"; do
+    name="${line%%|*}"
+    out="${line#*|}"
+    summary+=$'\n'"  [ FAIL ] ${name}"
+    [[ -n "$out" ]] && summary+=$'\n'"           result: ${out}"
+  done
+  summary+=$'\n'
+fi
+
+if [[ ${#warn_summary_lines[@]} -gt 0 ]]; then
+  summary+="
+WARNINGS:"
+  for line in "${warn_summary_lines[@]}"; do
+    name="${line%%|*}"
+    out="${line#*|}"
+    summary+=$'\n'"  [ WARN ] ${name}"
+    [[ -n "$out" ]] && summary+=$'\n'"           result: ${out}"
+  done
+  summary+=$'\n'
+fi
+
+summary+="
+ALL RESULTS BY CATEGORY:
 $all_test_results"
 
-# CS0360919
+# Colored / structured summary on stdout only (keep logfile free of ANSI codes)
+print_testing_summary
+
+# Also append a plain copy at the end of the logfile for easy scanning
+{
+  echo "$DIVIDER"
+  echo "$summary"
+  echo "$DIVIDER"
+} >> "$LOGFILE"
+
+# CS0360919 - inject plain summary into the placeholder near the top of the log
 echo "$summary" > /tmp/summary_temp.txt
-awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync && rm /tmp/summary_temp.txt
+awk '
+  /<SUMMARY_BLOCK>/ {
+    while ((getline line < "/tmp/summary_temp.txt") > 0) print line
+    close("/tmp/summary_temp.txt")
+    next
+  }
+  { print }
+' "$LOGFILE" > temp && mv temp "$LOGFILE" && sync && rm -f /tmp/summary_temp.txt
 
 if [ "$capture_journal" != true ] && [ "$gather_logs" == true ]; then
   # archive stuntlog, all logs in /home/sailpoint/log/ and config files in /home/sailpoint/ccg/
