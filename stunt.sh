@@ -738,54 +738,94 @@ no_proxy_double_quotes() {
   fi
 }
 
-get_current_image_tag() {
-  image_name="$1"
-  current_image_id=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep current | head -n 1 | awk '{print $3}')
-  current_image_tag=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}' | head -n 1)
-  echo "$current_image_tag" | grep -o '^[[:digit:]]*'
+# Normalize `docker images` rows to repo|tag|id.
+# Supports the classic REPOSITORY/TAG/IMAGE ID columns and the newer IMAGE/ID columns
+# where the first field is already "repo:tag". Uses the output captured at startup
+# so we do not invoke sudo again (inspect/ps -q are often absent from sudoers).
+normalize_docker_images() {
+  local line f1 f2 f3 repo tag id
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" == REPOSITORY* || "$line" == IMAGE* ]] && continue
+    read -r f1 f2 f3 _ <<< "$line"
+    [[ -z "$f1" || "$f1" == "<none>" ]] && continue
+    if [[ "$f1" == *:* && "$f2" =~ ^[0-9a-fA-F]{12} ]]; then
+      repo="${f1%:*}"
+      tag="${f1##*:}"
+      id="$f2"
+    else
+      repo="$f1"
+      tag="$f2"
+      id="$f3"
+    fi
+    [[ -z "$id" || ! "$id" =~ ^[0-9a-fA-F]{12} ]] && continue
+    printf '%s|%s|%s\n' "$repo" "$tag" "${id:0:12}"
+  done
 }
 
-# Running containers use a :current tag. The build/version tag shares that image ID.
-# Print one row per running container: name + resolved version tag(s).
-print_running_container_versions() {
-  local images_raw containers_raw
-  local repo tag id short name image_id version
-  declare -A version_by_id=()
-
-  images_raw=$(sudo docker images --no-trunc --format '{{.Repository}}|{{.Tag}}|{{.ID}}' 2>/dev/null) || images_raw=""
+get_current_image_tag() {
+  local image_name="$1"
+  local repo tag id current_id="" version_tag=""
+  local normalized
+  normalized=$(printf '%s\n' "$DOCKER_IMAGES_OUTPUT" | normalize_docker_images)
   while IFS='|' read -r repo tag id; do
-    [[ -z "$id" || -z "$tag" ]] && continue
-    short="${id#sha256:}"
-    short="${short:0:12}"
+    [[ "$repo" == */"$image_name" || "$repo" == "$image_name" ]] || continue
+    if [[ "$tag" == "current" ]]; then
+      current_id="$id"
+      break
+    fi
+  done <<< "$normalized"
+  [[ -z "$current_id" ]] && return
+  while IFS='|' read -r repo tag id; do
+    [[ "$id" == "$current_id" ]] || continue
+    [[ "$repo" == */"$image_name" || "$repo" == "$image_name" ]] || continue
     case "$tag" in
       current|latest|previous|"<none>") continue ;;
     esac
-    if [[ -z "${version_by_id[$short]}" ]]; then
-      version_by_id[$short]="$tag"
-    elif [[ ",${version_by_id[$short]}," != *",$tag,"* ]]; then
-      version_by_id[$short]="${version_by_id[$short]}, $tag"
-    fi
-  done <<< "$images_raw"
+    version_tag="$tag"
+    break
+  done <<< "$normalized"
+  printf '%s\n' "$version_tag" | grep -o '^[[:digit:]]*' || true
+}
 
-  containers_raw=$(sudo docker ps -q 2>/dev/null)
-  if [[ -z "$containers_raw" ]]; then
-    echo "No running containers."
+# Running containers use a :current tag. The build/version tag shares that image ID.
+# Built only from DOCKER_PS_OUTPUT and DOCKER_IMAGES_OUTPUT (no extra sudo).
+print_running_container_versions() {
+  local normalized repo tag id shortname version
+  declare -A version_by_id=()
+  declare -A seen_id=()
+
+  normalized=$(printf '%s\n' "$DOCKER_IMAGES_OUTPUT" | normalize_docker_images)
+  if [[ -z "$normalized" ]]; then
+    echo "No docker image data available."
     return
   fi
 
+  while IFS='|' read -r repo tag id; do
+    [[ -z "$id" ]] && continue
+    case "$tag" in
+      current|latest|previous|"<none>") continue ;;
+    esac
+    if [[ -z "${version_by_id[$id]}" ]]; then
+      version_by_id[$id]="$tag"
+    elif [[ ",${version_by_id[$id]}," != *",$tag,"* ]]; then
+      version_by_id[$id]="${version_by_id[$id]}, $tag"
+    fi
+  done <<< "$normalized"
+
   printf '%-24s  %s\n' "CONTAINER" "VERSION"
   printf '%-24s  %s\n' "------------------------" "------------------------------"
-  # shellcheck disable=SC2086
-  sudo docker inspect --format '{{.Name}}|{{.Image}}' $containers_raw 2>/dev/null \
-    | while IFS='|' read -r name image_id; do
-        name="${name#/}"
-        short="${image_id#sha256:}"
-        short="${short:0:12}"
-        version="${version_by_id[$short]}"
-        [[ -z "$version" ]] && version="(no version tag for this image ID)"
-        printf '%-24s  %s\n' "$name" "$version"
-      done \
-    | sort
+  while IFS='|' read -r repo tag id; do
+    [[ "$tag" == "current" ]] || continue
+    [[ -n "${seen_id[$id]}" ]] && continue
+    shortname="${repo##*/}"
+    # Only images that are actually running. Match the short name so registry prefixes can differ.
+    printf '%s\n' "$DOCKER_PS_OUTPUT" | grep -F -q "/${shortname}:current" || continue
+    seen_id[$id]=1
+    version="${version_by_id[$id]}"
+    [[ -z "$version" ]] && version="(no version tag for this image ID)"
+    printf '%-24s  %s\n' "$shortname" "$version"
+  done <<< "$normalized" | sort
 }
 
 clean_non_current_images() {
@@ -1532,6 +1572,15 @@ else
 fi
 outro
 
+intro "Retrieving contents of /home/sailpoint/host-logging.yaml"
+if [[ -f /home/sailpoint/host-logging.yaml ]]; then
+  # Drop values whose key is a token or an API key. Keep the shape of the file visible.
+  sed -E 's/((^|[[:space:]])([A-Za-z0-9_.-]*([Tt][Oo][Kk][Ee][Nn]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]))[[:space:]]*:[[:space:]]*).*/\1<redacted>/' /home/sailpoint/host-logging.yaml >> "$LOGFILE"
+else
+  echo "INFO - /home/sailpoint/host-logging.yaml not found" >> "$LOGFILE"
+fi
+outro
+
 # intro "Getting RAM stats from ccg container"
 # expect "RAM to be at least 8GB for sandbox, and typically 16GB for prod applications"
 # sudo docker stats ccg --no-stream | awk 'NR==2' | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0 }' >> "$LOGFILE" ; 
@@ -1725,7 +1774,7 @@ fi
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
 current_charon=$(get_current_image_tag charon) 
-perform_test "Is charon version higher than $CHARON_MINIMUM_VERSION?" "if [[ $current_charon > $CHARON_MINIMUM_VERSION ]]; then echo true; fi" "==" "true" "==" "false" "system"
+perform_test "Is charon version higher than $CHARON_MINIMUM_VERSION?" "if [[ -z '$current_charon' ]]; then echo unknown; elif [[ '$current_charon' -gt $CHARON_MINIMUM_VERSION ]]; then echo true; else echo false; fi" "==" "true" "==" "false" "system"
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
 if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
