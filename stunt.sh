@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #constants
-VERSION="v2.4.2"
+VERSION="v2.4.3"
 CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
@@ -11,6 +11,7 @@ IPADDR=$(networkctl status | grep Address | sed 's/Address: //' | grep -E -o '[0
 DOCKER_PS_OUTPUT=$(sudo docker ps -s)
 DOCKER_IMAGES_OUTPUT=$(sudo docker images)
 STUNTOPTS=$1
+SAFE_RM="/opt/sailpoint/share/libexec/safe-rm"
 
 # colors for output
 GREEN='\033[0;32m'
@@ -43,6 +44,24 @@ check_enough_free_disk() {
   fi
 }
 
+# After SAASVA-1489, sudo rm is path-allowlisted only. Rotated logs / job dirs
+# go through safe-rm; never fall back to unbounded sudo rm.
+delete_rotated_logs() {
+  if [[ -x "$SAFE_RM" ]]; then
+    echo "Deleting rotated logs with $SAFE_RM"
+    sudo "$SAFE_RM" rotated-logs
+    return $?
+  fi
+  echo "safe-rm is not on this VA (needs charon with SAASVA-1489). Chowning /home/sailpoint/log then removing rotated files without sudo rm."
+  sudo chown -R sailpoint /home/sailpoint/log
+  rm -f /home/sailpoint/log/*.{0,1}
+}
+
+jobs_cleanup_advice() {
+  local op="$1"
+  echo "sudo ${SAFE_RM} ${op} && sudo reboot (requires charon with SAASVA-1489; do not use sudo rm -rf)"
+}
+
 #check if we're being run interactively or not
 
 if [ -t 0 ]; then
@@ -58,7 +77,7 @@ else
     echo "This VA is critically low on disk space. Attempting cleanup"
     current_images=$( echo "$DOCKER_IMAGES_OUTPUT" | grep 'current' | awk '{print "-e " $3}' | tr "\n" " ")
     echo "$DOCKER_IMAGES_OUTPUT" | grep -v $current_images -e REPOSITORY | awk '{print $1 ":" $2}' | xargs sudo docker rmi
-    sudo rm -f /home/sailpoint/log/*.{0,1}  # delete rotated logs
+    delete_rotated_logs
     sudo journalctl --no-pager --rotate
     sudo journalctl --no-pager --vacuum-time=1d
     # checking if that was enough space freed
@@ -1560,11 +1579,11 @@ echo "$num_pending_jobs pending jobs in the directory." >> "$LOGFILE"
 ls -al /opt/sailpoint/workflow/jobs >> "$LOGFILE"
 outro
 
-expect "this to have fewer than 20 completed jobs. If lots of jobs are > 1 week old, run: sudo rm -rf /opt/sailpoint/share/jobs/* && sudo reboot"
+expect "this to have fewer than 20 completed jobs. If lots of jobs are > 1 week old, run: $(jobs_cleanup_advice share-jobs)"
 perform_test "Does /opt/sailpoint/share/jobs have fewer than 20 jobs?" "get_num_share_jobs" -lt 20 -gt 19 "system"
 outro
 
-expect "this to have fewer than 20 workflow jobs. If lots of jobs are > 1 week old, run: sudo rm -rf /opt/sailpoint/workflow/jobs/* && sudo reboot"
+expect "this to have fewer than 20 workflow jobs. If lots of jobs are > 1 week old, run: $(jobs_cleanup_advice workflow-jobs)"
 perform_test "Does /opt/sailpoint/workflow/jobs have fewer than 20 jobs?" "get_num_workflow_jobs" -lt 20 -gt 19 "system"
 outro
 
