@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #constants
-VERSION="v2.4.2"
+VERSION="v3.0.0"
 CHARON_MINIMUM_VERSION="1647"
 ROOT_FS_MINIMUM_FREE_KB="2000000" #we want at least 2GB free normally
 ROOT_FS_MINIMUM_FREE_KB_EMERGENCY="100000" # we must have at least 100 MB for things to function
@@ -81,12 +81,6 @@ else
 fi
 
 ### INIT ###
-if [[ $(sudo systemctl status canal | grep enabled | wc -l) -gt 0 ]]; then
-  IS_CANAL_ENABLED=true
-else
-  IS_CANAL_ENABLED=false
-fi
-
 if [[ -e "$CONFIG_YAML_FILE_PATH" ]]; then
   # Set global vars whose data come from config.yaml
   CONFIG_YAML=$(< $CONFIG_YAML_FILE_PATH )
@@ -94,8 +88,6 @@ if [[ -e "$CONFIG_YAML_FILE_PATH" ]]; then
   ORGNAME="${ORGNAME//$'\r'/}"                                #remove return characters
   PODNAME=$( echo "$CONFIG_YAML" | grep -oP '(?<=pod: ).*' )
   PODNAME="${PODNAME//$'\r'/}"                                #remove return characters
-  # detect Canal in systemd
-  #https://app.asana.com/1/40019095804142/project/1212671613187404/task/1212991215552901?focus=true
 else
   echo "*** Config file not found. "
   echo "*** Would you like to create a temporary config.yaml so stunt can run?"
@@ -111,6 +103,7 @@ else
       echo -e "pod: $PODNAME\norg: $ORGNAME\napiUser: \"testapiuser\"\napiKey: \"::!:A2:testapikey\"\nkeyPassphrase: \"::!:A2:testkeypassphrase\"" > $CONFIG_YAML_FILE_PATH
       if [-f $CONFIG_YAML_FILE_PATH ]; then
         echo "File generated successfully."
+        CONFIG_YAML=$(< $CONFIG_YAML_FILE_PATH )
       else 
         echo "ERROR: Unknown error when checking for existence of test config.yaml; exiting." 
         endscript
@@ -122,6 +115,28 @@ else
   esac
 fi
 
+# Secure Tunnel / canal intent comes from config.yaml (uncommented tunnelTraffic: true).
+# Only when that is present do we probe systemd for canal enablement; canal suites run
+# only when BOTH config and systemd say tunnel/canal is enabled.
+# https://app.asana.com/1/40019095804142/project/1212671613187404/task/1212991215552901?focus=true
+IS_TUNNEL_CONFIGURED=false
+if echo "$CONFIG_YAML" | grep -Eiq '^[[:space:]]*tunnelTraffic:[[:space:]]*true([[:space:]]*(#.*)?)?$'; then
+  IS_TUNNEL_CONFIGURED=true
+fi
+
+IS_CANAL_SERVICE_ENABLED=false
+IS_CANAL_ENABLED=false
+if [[ "$IS_TUNNEL_CONFIGURED" == true ]]; then
+  # Gate systemctl canal checks on tunnelTraffic; avoid status|grep false positives.
+  if [[ "$(systemctl is-enabled canal 2>/dev/null)" == "enabled" ]]; then
+    IS_CANAL_SERVICE_ENABLED=true
+  fi
+  # Both must be true to run canal/tun0 diagnostic suites.
+  if [[ "$IS_CANAL_SERVICE_ENABLED" == true ]]; then
+    IS_CANAL_ENABLED=true
+  fi
+fi
+
 ### GLOBAL RUNTIME VARIABLES ###
 
 DATE=$(date -u +"%b_%d_%y-%H_%M")
@@ -129,7 +144,7 @@ DIVIDER="=======================================================================
 ZIPFILE=/home/sailpoint/logs.$ORGNAME-$PODNAME-$(hostname)-$IPADDR-$DATE.zip # POD-ORG-CLUSTER_ID-VA_ID.zip. 
 LISTOFLOGS="/home/sailpoint/log/*.log"
 CCGDIR="/home/sailpoint/ccg/"
-RUNNING_FLATCAR_VERSION="$(cat /etc/os-release | grep -oP 'VERSION=\K[^<]*')"
+RUNNING_FLATCAR_VERSION="$(grep -oP 'VERSION=\K[^<]*' /etc/os-release | tr -d '"')"
 FLATCAR_RELEASES_URL="https://www.flatcar.org/releases"
 FLATCAR_STABLE_RELEASE_FILE="https://stable.release.flatcar-linux.net/amd64-usr/current/version.txt"
 CERT_DIRECTORY="/home/sailpoint/certificates"
@@ -163,7 +178,7 @@ if [[ $PODNAME == *"$FEDRAMP_STRING"* ]]; then
   IS_ORG_FEDRAMP=true
   AWS_REGION="us-gov-west-1"
   ISC_DOMAIN="saas.sailpointfedramp.com"
-  ISC_ACCESS="idn.sailpointfedramp.com"
+  ISC_ACCESS="idn.sailpointfedramp.com" ## TODO - is this failing in fedramp?
 fi
 
 # identitynow-demo.com compatibility - CS0390503
@@ -185,6 +200,9 @@ passes=0
 failures=0
 warnings=0
 declare -A test_categories
+declare -a fail_summary_lines=()
+declare -a warn_summary_lines=()
+RESULT_SEP=$'\x1e' # record separator; avoids commas in test names breaking summaries
 summary=""
 output_document_summary="$summary"
 
@@ -254,31 +272,57 @@ while getopts ":htpfoslLjnucr" option; do
     esac
 done
 
+THIN_DIVIDER="--------------------------------------------------------------------------------"
+
 # args:
 # $1 == stdout description
 intro() {
   set -f #Disable globbing
-  echo "$DIVIDER" >> "$LOGFILE"
-  echo "$1"
-  echo "$1" >> "$LOGFILE"
-  echo "$DIVIDER" >> "$LOGFILE"
+  echo -e "${CYAN}>>${RESETCOLOR} $1"
+  {
+    echo
+    echo ">> $1"
+    echo "$THIN_DIVIDER"
+  } >> "$LOGFILE"
   set +f
 }
 
 outro() {
   set -f
   echo >> "$LOGFILE"
-  echo
   set +f
 }
 
 expect() {
   set -f
-  echo "********************************************************************************" >> "$LOGFILE"
-  echo "*** Expect $1" >> "$LOGFILE"
-  echo "********************************************************************************" >> "$LOGFILE"
-  echo >> "$LOGFILE"
+  echo "   expect: $1" >> "$LOGFILE"
   set +f
+}
+
+# Wrap a command's stdout+stderr in DUMP START/END markers with a line count so
+# agents can skip bulk diagnostics while still having them available.
+# Usage: log_dump "label" command [args...]
+log_dump() {
+  local label="$1"
+  shift
+  local tmp lines
+  tmp=$(mktemp /tmp/stunt_dump.XXXXXX)
+  "$@" >"$tmp" 2>&1 || true
+  lines=$(wc -l < "$tmp" | tr -d ' ')
+  {
+    echo "----- DUMP START: ${label} (${lines} lines) -----"
+    cat "$tmp"
+    echo "----- DUMP END: ${label} -----"
+  } >> "$LOGFILE"
+  rm -f "$tmp"
+}
+
+# Curl logging for support: keep connect / TLS / HTTP details (-v) but avoid
+# -vv/-vvv hex dumps that balloon the stuntlog with little diagnostic value.
+log_curl() {
+  local label="$1"
+  shift
+  log_dump "$label" curl -sS -v -i --connect-timeout "$seconds_between_tests" "$@"
 }
 
 endscript() {
@@ -304,17 +348,52 @@ get_num_workflow_jobs() {
   echo $(find "/opt/sailpoint/workflow/jobs" -maxdepth 1 -type f | wc -l)
 }
 
+# Print PASS/FAIL/WARN to the logfile. Stdout shows FAIL and WARN only.
+print_test_status() {
+  local status="$1"
+  local test_name="$2"
+  local detail="${3:-}"
+  local color="$RESETCOLOR"
+  local tag
+
+  case "$status" in
+    PASS) color="$GREEN";  tag="[ PASS ]" ;;
+    FAIL) color="$RED";    tag="[ FAIL ]" ;;
+    WARN) color="$YELLOW"; tag="[ WARN ]" ;;
+    *)    tag="[ ---- ]" ;;
+  esac
+
+  echo "${tag} ${test_name}" >> "$LOGFILE"
+
+  # Customers on stdout only need problems. Passes stay in the stuntlog.
+  if [[ "$status" == "PASS" ]]; then
+    return
+  fi
+
+  echo -e "${color}${tag}${RESETCOLOR} ${test_name}"
+  if [[ -n "$detail" ]]; then
+    echo -e "           ${detail}"
+    echo "           ${detail}" >> "$LOGFILE"
+  fi
+}
+
 add_test_result() {
   local category="$1"
   local test_name="$2"
   local test_result="$3"
   local test_output="$4"
+  local entry="${test_result}|${test_name}|${test_output}"
 
   if [[ -z "${test_categories[$category]}" ]]; then
-    test_categories["$category"]="$test_name: $test_result -- Test output: $test_output"
+    test_categories["$category"]="$entry"
   else
-    test_categories["$category"]="${test_categories["$category"]},$test_name: $test_result -- Test output: $test_output"
+    test_categories["$category"]="${test_categories["$category"]}${RESULT_SEP}${entry}"
   fi
+
+  case "$test_result" in
+    fail) fail_summary_lines+=("${test_name}|${test_output}") ;;
+    warn) warn_summary_lines+=("${test_name}|${test_output}") ;;
+  esac
 }
 
 # CS0237804
@@ -329,51 +408,120 @@ perform_test() {
   local fail_comparison_operator="$5"
   local fail_expected_condition="$6"
   local test_category="$7"
+  local detail=""
 
   output=$(eval "$test_command")
-
-  echo -e $DIVIDER
+  total_tests=$((total_tests + 1))
 
   if [ "$pass_comparison_operator" = "==" ] && [ "$output" = "$pass_expected_condition" ]; then
-    echo -e "PASS: $test_name" >> "$LOGFILE"
-    echo -e "${GREEN}PASS$RESETCOLOR: $test_name"
+    print_test_status "PASS" "$test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" = "==" ] && [ "$output" = "$fail_expected_condition" ]; then
-    echo -e "FAIL: $test_name" >> "$LOGFILE"
-    echo -e "${RED}FAIL$RESETCOLOR: $test_name"
+    detail="got: ${output}    expected: ${pass_comparison_operator} ${pass_expected_condition}"
+    print_test_status "FAIL" "$test_name" "$detail"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   elif [ "$pass_comparison_operator" != "==" ] && [ "$output" "$pass_comparison_operator" "$pass_expected_condition" ]; then
-    echo -e "PASS: $test_name" >> "$LOGFILE"
-    echo -e "${GREEN}PASS$RESETCOLOR: $test_name"
+    print_test_status "PASS" "$test_name"
     ((passes++))
     add_test_result "$test_category" "$test_name" "pass" "$output"
   elif [ "$fail_comparison_operator" != "==" ] && [ "$output" "$fail_comparison_operator" "$fail_expected_condition" ]; then
-    echo -e "FAIL: $test_name" >> "$LOGFILE"
-    echo -e "${RED}FAIL$RESETCOLOR: $test_name"
+    detail="got: ${output}    expected pass when: ${pass_comparison_operator} ${pass_expected_condition}"
+    print_test_status "FAIL" "$test_name" "$detail"
     ((failures++))
     add_test_result "$test_category" "$test_name" "fail" "$output"
   else
-    echo -e "WARNING: $test_name" >> "$LOGFILE"
-    echo -e "${YELLOW}WARNING$RESETCOLOR: $test_name"
+    detail="got: ${output}    (did not match pass or fail criteria)"
+    print_test_status "WARN" "$test_name" "$detail"
     ((warnings++))
     add_test_result "$test_category" "$test_name" "warn" "$output"
   fi
+}
 
-  echo -e $DIVIDER
+format_status_tag() {
+  case "$1" in
+    pass) echo "[ PASS ]" ;;
+    fail) echo "[ FAIL ]" ;;
+    warn) echo "[ WARN ]" ;;
+    *)    echo "[ ---- ]" ;;
+  esac
 }
 
 output_all_tests_by_category() {
-  for category in "${!test_categories[@]}"; do
-    echo "Category: $category"
-    tests="${test_categories[$category]}"
-    IFS=',' read -ra test_results <<< "$tests"
+  local category tests entry status name out tag rest
+  # Stable category order for easier scanning
+  local ordered_categories=("system" "configuration" "networking" "certificates" "script")
+  local printed_categories=()
+  local -a entries=()
 
-    for test_result in "${test_results[@]}"; do
-      echo "  $test_result"
+  for category in "${ordered_categories[@]}" "${!test_categories[@]}"; do
+    # Skip missing / already printed categories
+    [[ -z "${test_categories[$category]+x}" ]] && continue
+    [[ " ${printed_categories[*]} " == *" $category "* ]] && continue
+    printed_categories+=("$category")
+
+    echo
+    echo "  Category: $category"
+    tests="${test_categories[$category]}"
+    entries=()
+    # Split on record separator into an array (avoids trailing-empty read quirks)
+    while IFS= read -r -d "$RESULT_SEP" entry; do
+      [[ -n "$entry" ]] && entries+=("$entry")
+    done < <(printf '%s%s' "$tests" "$RESULT_SEP")
+
+    for entry in "${entries[@]}"; do
+      status="${entry%%|*}"
+      rest="${entry#*|}"
+      name="${rest%%|*}"
+      out="${rest#*|}"
+      # If name equals out, there was no separate output field
+      if [[ "$name" == "$out" && "$rest" != *"|"* ]]; then
+        out=""
+      fi
+      tag=$(format_status_tag "$status")
+      printf "    %s %s\n" "$tag" "$name"
+      if [[ "$status" != "pass" && -n "$out" ]]; then
+        printf "             result: %s\n" "$out"
+      fi
     done
   done
+}
+
+print_testing_summary() {
+  local line name out
+  local thin_divider="--------------------------------------------------------------------------------"
+
+  echo "$DIVIDER"
+  echo "TEST SUMMARY"
+  echo "$DIVIDER"
+  echo -e "  Passed:   ${GREEN}${passes}${RESETCOLOR}"
+  echo -e "  Failed:   ${RED}${failures}${RESETCOLOR}"
+  echo -e "  Warnings: ${YELLOW}${warnings}${RESETCOLOR}"
+  echo -e "  Total:    ${total_tests}"
+  echo "$thin_divider"
+
+  if [[ ${#fail_summary_lines[@]} -gt 0 ]]; then
+    echo "FAILURES:"
+    for line in "${fail_summary_lines[@]}"; do
+      name="${line%%|*}"
+      out="${line#*|}"
+      echo -e "  ${RED}[ FAIL ]${RESETCOLOR} ${name}"
+      [[ -n "$out" ]] && echo "           result: ${out}"
+    done
+    echo "$thin_divider"
+  fi
+
+  if [[ ${#warn_summary_lines[@]} -gt 0 ]]; then
+    echo "WARNINGS:"
+    for line in "${warn_summary_lines[@]}"; do
+      name="${line%%|*}"
+      out="${line#*|}"
+      echo -e "  ${YELLOW}[ WARN ]${RESETCOLOR} ${name}"
+      [[ -n "$out" ]] && echo "           result: ${out}"
+    done
+    echo "$thin_divider"
+  fi
 }
 
 # Handle exceptions
@@ -388,8 +536,7 @@ handle_error() {
   error_message="$1"
   intro "Script encountered an error with the following command: ${BASH_COMMAND}."
   echo "The stuntlog file at $LOGFILE contains an error due to the exception. Continuing... "
-  echo -e "Test $test_name: WARNING" >> "$LOGFILE"
-  echo -e "Test $test_name:${YELLOW} WARNING $RESETCOLOR"
+  print_test_status "WARN" "${test_name:-unknown test}" "error during: ${BASH_COMMAND}"
   add_test_result "script" "Error handler" "warn" "$1"
   ((warnings++))
   outro
@@ -465,10 +612,10 @@ cert_tester() {
     fi
   done
 
-  if [[ $failures > $starting_failures ]]; then
+  if [[ "$failures" -gt "$starting_failures" ]]; then
     echo "Failed or skipped certificates:"
     for cert_name in "${failed_certs[@]}"; do
-      echo -e "Test - $RED FAIL$RESETCOLOR: $cert_name"
+      print_test_status "FAIL" "$cert_name"
     done
   fi
 
@@ -591,11 +738,94 @@ no_proxy_double_quotes() {
   fi
 }
 
+# Normalize `docker images` rows to repo|tag|id.
+# Supports the classic REPOSITORY/TAG/IMAGE ID columns and the newer IMAGE/ID columns
+# where the first field is already "repo:tag". Uses the output captured at startup
+# so we do not invoke sudo again (inspect/ps -q are often absent from sudoers).
+normalize_docker_images() {
+  local line f1 f2 f3 repo tag id
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" == REPOSITORY* || "$line" == IMAGE* ]] && continue
+    read -r f1 f2 f3 _ <<< "$line"
+    [[ -z "$f1" || "$f1" == "<none>" ]] && continue
+    if [[ "$f1" == *:* && "$f2" =~ ^[0-9a-fA-F]{12} ]]; then
+      repo="${f1%:*}"
+      tag="${f1##*:}"
+      id="$f2"
+    else
+      repo="$f1"
+      tag="$f2"
+      id="$f3"
+    fi
+    [[ -z "$id" || ! "$id" =~ ^[0-9a-fA-F]{12} ]] && continue
+    printf '%s|%s|%s\n' "$repo" "$tag" "${id:0:12}"
+  done
+}
+
 get_current_image_tag() {
-  image_name="$1"
-  current_image_id=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep current | head -n 1 | awk '{print $3}')
-  current_image_tag=$(echo "$DOCKER_IMAGES_OUTPUT" | grep "$image_name" | grep "$current_image_id" | grep -v current | awk '{print $2}' | head -n 1)
-  echo "$current_image_tag" | grep -o '^[[:digit:]]*'
+  local image_name="$1"
+  local repo tag id current_id="" version_tag=""
+  local normalized
+  normalized=$(printf '%s\n' "$DOCKER_IMAGES_OUTPUT" | normalize_docker_images)
+  while IFS='|' read -r repo tag id; do
+    [[ "$repo" == */"$image_name" || "$repo" == "$image_name" ]] || continue
+    if [[ "$tag" == "current" ]]; then
+      current_id="$id"
+      break
+    fi
+  done <<< "$normalized"
+  [[ -z "$current_id" ]] && return
+  while IFS='|' read -r repo tag id; do
+    [[ "$id" == "$current_id" ]] || continue
+    [[ "$repo" == */"$image_name" || "$repo" == "$image_name" ]] || continue
+    case "$tag" in
+      current|latest|previous|"<none>") continue ;;
+    esac
+    version_tag="$tag"
+    break
+  done <<< "$normalized"
+  printf '%s\n' "$version_tag" | grep -o '^[[:digit:]]*' || true
+}
+
+# Running containers use a :current tag. The build/version tag shares that image ID.
+# Built only from DOCKER_PS_OUTPUT and DOCKER_IMAGES_OUTPUT (no extra sudo).
+print_running_container_versions() {
+  local normalized repo tag id shortname version
+  declare -A version_by_id=()
+  declare -A seen_id=()
+
+  normalized=$(printf '%s\n' "$DOCKER_IMAGES_OUTPUT" | normalize_docker_images)
+  if [[ -z "$normalized" ]]; then
+    echo "No docker image data available."
+    return
+  fi
+
+  while IFS='|' read -r repo tag id; do
+    [[ -z "$id" ]] && continue
+    case "$tag" in
+      current|latest|previous|"<none>") continue ;;
+    esac
+    if [[ -z "${version_by_id[$id]}" ]]; then
+      version_by_id[$id]="$tag"
+    elif [[ ",${version_by_id[$id]}," != *",$tag,"* ]]; then
+      version_by_id[$id]="${version_by_id[$id]}, $tag"
+    fi
+  done <<< "$normalized"
+
+  printf '%-24s  %s\n' "CONTAINER" "VERSION"
+  printf '%-24s  %s\n' "------------------------" "------------------------------"
+  while IFS='|' read -r repo tag id; do
+    [[ "$tag" == "current" ]] || continue
+    [[ -n "${seen_id[$id]}" ]] && continue
+    shortname="${repo##*/}"
+    # Only images that are actually running. Match the short name so registry prefixes can differ.
+    printf '%s\n' "$DOCKER_PS_OUTPUT" | grep -F -q "/${shortname}:current" || continue
+    seen_id[$id]=1
+    version="${version_by_id[$id]}"
+    [[ -z "$version" ]] && version="(no version tag for this image ID)"
+    printf '%-24s  %s\n' "$shortname" "$version"
+  done <<< "$normalized" | sort
 }
 
 clean_non_current_images() {
@@ -674,7 +904,10 @@ check_no_proxy_validate_format() {
 }
 
 get_lscpu_num_cpus () {
-  lscpu | grep -i ^CPU\(s | awk '{print $2}'
+  # First integer on the CPU(s) line only. perform_test then compares it numerically.
+  local n
+  n=$(lscpu | grep -i '^CPU(s)' | head -n 1 | grep -oE '[0-9]+' | head -n 1)
+  echo "${n:-0}"
 }
 
 get_free_total_mem_in_gb () {
@@ -683,6 +916,111 @@ get_free_total_mem_in_gb () {
 
 get_network_adapter_name () {
   ip -o link show | awk -F': ' '/state UP/ && $2 != "lo" {print $2; exit}'
+}
+
+# Return 0 if a primary NIC name looks like ens160 or eth0.
+has_expected_primary_nic () {
+  networkctl list 2>/dev/null | grep -E -c '\bens160\b|\beth0\b' | head -n1
+}
+
+# Return 0 when tun0 is present in networkctl list.
+tun0_exists () {
+  networkctl list 2>/dev/null | grep -E -c '\btun0\b' | head -n1
+}
+
+# Return 0 when tun0 reports as routable/online-ish in networkctl status.
+tun0_is_routable () {
+  local status
+  status=$(networkctl status tun0 2>/dev/null)
+  if echo "$status" | grep -qiE 'State:[[:space:]]+routable|Online state:[[:space:]]+online'; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+# Return 0 when update-engine override.conf is absent (desired state).
+override_conf_absent () {
+  if [[ -e /etc/systemd/system/update-engine.service.d/override.conf ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Return free KB on root filesystem.
+get_root_fs_free_kb () {
+  df -k / | awk 'NR==2 {print $4}'
+}
+
+# Return 0 when root filesystem type is not btrfs (Flatcar /oem may still be btrfs).
+root_fs_not_btrfs () {
+  local fstype
+  fstype=$(findmnt -n -o FSTYPE / 2>/dev/null)
+  if [[ "$fstype" == "btrfs" ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Return failed TCP connection attempts from netstat -st (0 if unavailable).
+get_tcp_failed_connection_attempts () {
+  local count
+  count=$(netstat -st 2>/dev/null | awk '/failed connection attempts/ {print $1; exit}')
+  if [[ -z "$count" ]]; then
+    echo 0
+  else
+    echo "$count"
+  fi
+}
+
+# Return 0 when /home/sailpoint/ip.list exists.
+ip_list_exists () {
+  if [[ -f /home/sailpoint/ip.list ]]; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+# Return 0 when a systemd unit file exists for the named service.
+service_unit_exists () {
+  local service="$1"
+  if [[ -f "/etc/systemd/system/${service}.service" ]]; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+# When static.network exists, return 0 if Address= includes CIDR notation.
+static_network_address_has_cidr () {
+  local addr
+  addr=$(grep -E '^Address=' /etc/systemd/network/static.network 2>/dev/null | head -n1 | cut -d= -f2-)
+  if [[ "$addr" == */* ]]; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+# When static.network exists, return 0 if each DNS= is on its own line (no comma-separated DNS values).
+static_network_dns_one_per_line () {
+  if grep -E '^DNS=.*,' /etc/systemd/network/static.network >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Return 0 when canal systemd unit is enabled (only meaningful when tunnelTraffic is set).
+canal_systemd_enabled () {
+  if [[ "$(systemctl is-enabled canal 2>/dev/null)" == "enabled" ]]; then
+    echo 0
+  else
+    echo 1
+  fi
 }
 
 get_iqservice_cert () {
@@ -694,7 +1032,7 @@ get_iqservice_cert () {
     read -p "Enter the IP address or hostname of the IQService server: " iqservice_network_address
     read -p "Enter the TLS port for the IQService (usually 5050 or 5051): " iqservice_secure_port
     local cert_filepath="/home/sailpoint/certificates/${iqservice_network_address}.cer"
-    timeout 7 openssl s_client -connect $iqservice_network_address:$iqservice_secure_port >&2 | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > $cert_filepath;
+    timeout 7 openssl s_client -connect "$iqservice_network_address":"$iqservice_secure_port" >&2 | grep -Pzo '(?s)-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----' > "$cert_filepath";
     sync
 
     if test -f $cert_filepath ; then                                                                          # if new cert exists,
@@ -769,23 +1107,50 @@ fi
 
 virt_host=$(systemd-detect-virt)
 
-# Start the tests by placing a header in the logfile
-echo $DIVIDER | tee -a "$LOGFILE"
-echo "$(date -u) - STARTING TESTS for $ORGNAME on $PODNAME"
-echo $DIVIDER
-echo "*** STARTING TESTS ***" | tee -a "$LOGFILE"
-echo "Date:                 $(date -u)" | tee -a "$LOGFILE"
-echo "Stunt ver.:           $VERSION" | tee -a "$LOGFILE"
-echo "Org:                  $ORGNAME" | tee -a "$LOGFILE"
-echo "Pod:                  $PODNAME" | tee -a "$LOGFILE"
-echo "IP Address:           $IPADDR" | tee -a "$LOGFILE"
-echo "Machine-id:           $MACHINE_ID" | tee -a "$LOGFILE"
-echo "Canal enabled:        $IS_CANAL_ENABLED" | tee -a "$LOGFILE"
-echo "Virtualization host:  $virt_host" | tee -a "$LOGFILE"
-echo "Flags used for stunt: $STUNTOPTS" | tee -a "$LOGFILE"
-echo $DIVIDER >> "$LOGFILE"
-echo "<SUMMARY_BLOCK>" >> "$LOGFILE"
-echo $DIVIDER >> "$LOGFILE"
+# Identity and run metadata stay in the stuntlog. Stdout only announces the run.
+{
+  echo "$DIVIDER"
+  echo "$(date -u) - STARTING TESTS for $ORGNAME on $PODNAME"
+  echo "$DIVIDER"
+  echo "*** STARTING TESTS ***"
+  echo "Date:                 $(date -u)"
+  echo "Stunt ver.:           $VERSION"
+  echo "Org:                  $ORGNAME"
+  echo "Pod:                  $PODNAME"
+  echo "IP Address:           $IPADDR"
+  echo "Machine-id:           $MACHINE_ID"
+  echo "Canal enabled:        $IS_CANAL_ENABLED (config tunnelTraffic=$IS_TUNNEL_CONFIGURED, systemd=$IS_CANAL_SERVICE_ENABLED)"
+  echo "Virtualization host:  $virt_host"
+  echo "Flags used for stunt: $STUNTOPTS"
+  echo "$DIVIDER"
+  echo "HOW TO READ THIS LOG"
+  echo "  1. Read the Post test summary below first (failures and warnings)."
+  echo "  2. Search for [ FAIL ] or [ WARN ] to jump to each failing check in context."
+  echo "  3. Section headers start with '>> '. Bulk diagnostics are wrapped in"
+  echo "     DUMP START/END markers and can be skipped unless you need raw detail."
+  echo "  4. Full journal capture (when needed) is available via the -j flag / zip."
+  echo "$DIVIDER"
+  echo "<SUMMARY_BLOCK>"
+  echo "$DIVIDER"
+} >> "$LOGFILE"
+echo -e "${CYAN}>>${RESETCOLOR} Starting tests for $ORGNAME on $PODNAME"
+outro
+
+# Canal systemd check is only run when tunnelTraffic: true is active in config.yaml.
+intro "Checking Secure Tunnel / canal enablement"
+echo "tunnelTraffic configured: $IS_TUNNEL_CONFIGURED" >> "$LOGFILE"
+if [[ "$IS_TUNNEL_CONFIGURED" == true ]]; then
+  expect "canal systemd unit to be enabled when tunnelTraffic: true is set in config.yaml."
+  sudo systemctl status canal >> "$LOGFILE" 2>&1 || true
+  perform_test "Is canal systemd-enabled while tunnelTraffic: true?" "canal_systemd_enabled" -eq 0 -eq 1 "configuration"
+  echo "canal systemd enabled:    $IS_CANAL_SERVICE_ENABLED" >> "$LOGFILE"
+  if [[ "$IS_CANAL_SERVICE_ENABLED" != true ]]; then
+    echo -e "${YELLOW}WARNING:$RESETCOLOR tunnelTraffic: true is set, but canal is not systemd-enabled." | tee -a "$LOGFILE"
+    echo "         Canal/tun0 suites are skipped until both config and systemd enablement are true." | tee -a "$LOGFILE"
+  fi
+else
+  echo "No active tunnelTraffic: true in config.yaml; skipping canal systemd status check." >> "$LOGFILE"
+fi
 outro
 
 # Download TLS cert from IQService process
@@ -868,7 +1233,7 @@ if [ "$do_update" == "true" ]; then
   if [[ $(grep "UPDATE_STATUS_REPORTING_ERROR_EVENT" $LOGFILE | wc -l) -gt 0 ]]; then
     echo "Found UPDATE_STATUS_REPORTING_ERROR_EVENT during update; shunting update-engine logs to stuntlog" | tee -a "$LOGFILE"
     intro "journalctl update-engine for last 2 hours"
-    sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE"
+    log_dump "update-engine journal (2 hours)" sudo journalctl --no-pager -u update-engine -S "2 hours ago"
   fi
   if [[ $(grep "NO_UPDATE_AVAILABLE" $LOGFILE | wc -l) -gt 0 ]]; then
     echo "Found NO_UPDATE_AVAILABLE during update; Resetting machine-id again and doing double-update" | tee -a "$LOGFILE"
@@ -896,7 +1261,7 @@ if [ "$curl_test" == "true" ]; then
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
       echo "Testing connection to SQS: " | tee -a "$LOGFILE"
       expect "a 404 error."
-      curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://sqs.$AWS_REGION.amazonaws.com" >> "$LOGFILE"
+      log_curl "alternating curl SQS" -L "https://sqs.$AWS_REGION.amazonaws.com"
       echo | tee -a "$LOGFILE"
       run_sqs=false;
       sleep 4;
@@ -904,7 +1269,7 @@ if [ "$curl_test" == "true" ]; then
       echo $(date -u +"%b_%d_%y-%H:%M:%S") >> "$LOGFILE"
       echo "Testing connection to S3: " | tee -a "$LOGFILE"
       expect "a 403 error."
-      curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://sppcbu-va-images.s3.amazonaws.com" >> "$LOGFILE"
+      log_curl "alternating curl S3" -L "https://sppcbu-va-images.s3.amazonaws.com"
       echo | tee -a "$LOGFILE"
       run_sqs=true;
       sleep 4;
@@ -946,6 +1311,10 @@ if [[ $key_passphrase_length -lt 1 ]]; then
 fi
 outro
 
+perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
+echo "uname output: $(uname -a)" >> "$LOGFILE"
+outro
+
 intro "Retrieving history of commands run on this session"
 history >> "$LOGFILE"
 outro
@@ -964,10 +1333,6 @@ if [[ $ip_result == 1 ]]; then
 else
   perform_test "Is IP address ($IPADDR) private?" "is_ip_private $IPADDR" -eq 0 -eq 1 "networking"
 fi
-outro
-
-perform_test "Does kernel version name report flatcar?" "uname -a | grep flatcar | wc -m" -gt 6 -eq 0 "system"
-echo "uname output: $(uname -a)" >> "$LOGFILE"
 outro
 
 # CS0239311 - If left unsynced, could result in excessive message processing times
@@ -1006,6 +1371,7 @@ fi
 outro
 
 intro "Checking for ip.list and retrieving contents of file"
+perform_test "Does /home/sailpoint/ip.list exist?" "ip_list_exists" -eq 0 -eq 1 "configuration"
 if test -f /home/sailpoint/ip.list; then
   cat /home/sailpoint/ip.list >> "$LOGFILE"
 elif [[ "$do_fixup" == true ]]; then
@@ -1014,6 +1380,7 @@ elif [[ "$do_fixup" == true ]]; then
 else
   echo -e "${YELLOW}WARNING:$RESETCOLOR ip.list file is missing. See KB article: https://sailpoint.service-now.com/kb?id=kb_article_view&sysparm_article=KB0019278" 
 fi
+outro
 
 intro "Checking for existence of files in /opt/sailpoint/share/"
 perform_test "Does /opt/sailpoint/share/bin/ contain va-bootstrap?" "if [ -f \"/opt/sailpoint/share/bin/va-bootstrap\" ]; then echo 0; else echo 1; fi" -eq 0 -ge 1 "system"
@@ -1047,6 +1414,8 @@ if test -f /etc/systemd/network/static.network; then
   expect "individual DNS entries to be on separate lines beginning with 'DNS'."
   expect "the IP address to include CIDR notation."
   cat /etc/systemd/network/static.network >> "$LOGFILE"
+  perform_test "Does static.network Address= include CIDR notation?" "static_network_address_has_cidr" -eq 0 -eq 1 "configuration"
+  perform_test "Does static.network list DNS= one per line (no commas)?" "static_network_dns_one_per_line" -eq 0 -eq 1 "configuration"
 if grep -q "DHCP=yes" /etc/systemd/network/static.network; then #check if static.network actually requests DHCP
     static_network_file_dhcp_yes=true
   else
@@ -1091,7 +1460,7 @@ if [[ $(echo $update_engine_status | grep "UPDATE_STATUS_UPDATED_NEED_REBOOT" ) 
   echo -e "${INFO}INFO$RESETCOLOR: An OS update is waiting; please reboot." | tee -a $LOGFILE
   ADD_REBOOT_MESSAGE=true
 else
-  echo -e "${INFO}INFO$RESETCOLOR: Current update-engine status: $update_engine_status" | tee -a $LOGFILE
+  echo "Current update-engine status: $update_engine_status" >> "$LOGFILE"
 fi
 outro
 
@@ -1102,7 +1471,7 @@ outro
 
 intro "Retrieving CPU information"
 expect "the number of CPU(s) to be >= 4 CPUs. This is from AWS m4.large specs."
-perform_test "Is number of CPUs greater than or equal to 4?" "get_lscpu_num_cpus" ">" 3 "<" 4 "system"
+perform_test "Is number of CPUs greater than or equal to 4?" "get_lscpu_num_cpus" -gt 3 -lt 4 "system"
 lscpu >> "$LOGFILE"
 outro
 
@@ -1118,8 +1487,11 @@ outro
 
 intro "Network list for all adapters"
 expect "one of two adapters to exist: ens160 or eth0. If canal is enabled, tun0 should be in this list as well."
+# Unusual NIC names are a warning for support review, not a hard failure.
+perform_test "Does networkctl list show ens160 or eth0?" "has_expected_primary_nic" -gt 0 -eq -1 "networking"
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "that tun0 exists and is routable."
+  perform_test "Does tun0 exist when Secure Tunnel is enabled?" "tun0_exists" -gt 0 -eq 0 "networking"
 fi
 networkctl list >> "$LOGFILE"
 outro
@@ -1133,6 +1505,7 @@ outro
 
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "tun0 adapter to be in a 'routable (configuring)' state, and to show the online state as 'online'."
+  perform_test "Is tun0 routable/online?" "tun0_is_routable" -eq 0 -eq 1 "networking"
   networkctl status tun0 >> "$LOGFILE" 2>&1
 fi
 
@@ -1143,10 +1516,14 @@ get_charon_network_test_line | sed -n 's/.*Networking check results:\\n//;s/\\n/
 outro
 
 intro "Testing direct connection to regional Secure Tunnel servers"
+if [[ "$IS_CANAL_ENABLED" != true ]]; then
+  echo "Skipping Secure Tunnel server connection tests: requires tunnelTraffic: true and canal systemd-enabled." >> "$LOGFILE"
+  outro
+else
 expect "tests below to pass for every IP. On failure(s), ask if DPI (Deep Packet Inspection) or any variation is decrypting traffic from the VAs"
 if [[ $PODNAME == *"useast1"* ||  $PODNAME == *"cook"* || $PODNAME == *"fiji"* || $PODNAME == *"uswest2"* || $PODNAME == *"cacentral1"* ]]; then
   # us-east-1 PODNAMEs contain: useast1 cook fiji uswest2 cacentral1
-  echo "Using us-east-1 endpoints: " | tee -a "$LOGFILE"
+  echo "Using us-east-1 endpoints: " >> "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 52.206.130.59" "canal_connection_test 52.206.130.59" -gt 4 -eq 0 "networking"
   outro
   perform_test "Canal Server Connection Test to IP: 52.206.133.183" "canal_connection_test 52.206.133.183" -gt 4 -eq 0 "networking"
@@ -1155,7 +1532,7 @@ if [[ $PODNAME == *"useast1"* ||  $PODNAME == *"cook"* || $PODNAME == *"fiji"* |
   outro
 elif [[ $PODNAME == *"eucentral1"* ]]; then
   # eu-central-1 PODNAMEs contain: eucentral1
-  echo "Using eu-central-1 endpoints: " | tee -a "$LOGFILE"
+  echo "Using eu-central-1 endpoints: " >> "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 35.157.132.22" "canal_connection_test 35.157.132.22" -gt 4 -eq 0 "networking"
   outro
   perform_test "Canal Server Connection Test to IP: 35.157.185.79" "canal_connection_test 35.157.185.79" -gt 4 -eq 0 "networking"
@@ -1164,7 +1541,7 @@ elif [[ $PODNAME == *"eucentral1"* ]]; then
   outro
 elif [[ $PODNAME == *"euwest2"* ]]; then
   #eu-west-2 PODNAMEs contain: euwest2
-  echo "Using eu-west-2 endpoints: " | tee -a "$LOGFILE"
+  echo "Using eu-west-2 endpoints: " >> "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 18.130.210.174" "canal_connection_test 18.130.210.174" -gt 4 -eq 0 "networking"
   outro
   perform_test "Canal Server Connection Test to IP: 18.130.148.201" "canal_connection_test 18.130.148.201" -gt 4 -eq 0 "networking"
@@ -1173,7 +1550,7 @@ elif [[ $PODNAME == *"euwest2"* ]]; then
   outro
 elif [[ $PODNAME == *"apsoutheast2"* ]]; then
   #apac PODNAMEs contain: apsoutheast2
-  echo "Using ap-southeast-2 endpoints: "| tee -a "$LOGFILE"
+  echo "Using ap-southeast-2 endpoints: " >> "$LOGFILE"
   perform_test "Canal Server Connection Test to IP: 52.65.42.92" "canal_connection_test 52.65.42.92" -gt 4 -eq 0 "networking"
   outro
   perform_test "Canal Server Connection Test to IP: 13.55.78.212" "canal_connection_test 13.55.78.212" -gt 4 -eq 0 "networking"
@@ -1182,11 +1559,12 @@ elif [[ $PODNAME == *"apsoutheast2"* ]]; then
   outro
 elif [[ $IS_ORG_FEDRAMP == true ]]; then
   #FEDRAMP
-  echo "FedRAMP org detected - Canal servers not supported"| tee -a "$LOGFILE"
+  echo "FedRAMP org detected - Canal servers not supported" >> "$LOGFILE"
   outro
 else
   echo "Unable to find appropriate canal server test with PODNAME: $PODNAME" >> "$LOGFILE"
   outro
+fi
 fi
 
 intro "Retrieving contents of /home/sailpoint/hosts.yaml"
@@ -1194,7 +1572,15 @@ if [[ -e "/home/sailpoint/hosts.yaml" ]]; then
   cat /home/sailpoint/hosts.yaml >> "$LOGFILE"
 else
   echo "INFO - /home/sailpoint/hosts.yaml not found" >> "$LOGFILE"
-  echo -e "${INFO}INFO$RESETCOLOR: hosts.yaml not found"
+fi
+outro
+
+intro "Retrieving contents of /home/sailpoint/host-logging.yaml"
+if [[ -f /home/sailpoint/host-logging.yaml ]]; then
+  # Drop values whose key is a token or an API key. Keep the shape of the file visible.
+  sed -E 's/((^|[[:space:]])([A-Za-z0-9_.-]*([Tt][Oo][Kk][Ee][Nn]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]))[[:space:]]*:[[:space:]]*).*/\1<redacted>/' /home/sailpoint/host-logging.yaml >> "$LOGFILE"
+else
+  echo "INFO - /home/sailpoint/host-logging.yaml not found" >> "$LOGFILE"
 fi
 outro
 
@@ -1240,14 +1626,16 @@ fi
 # CS0363017
 intro "Checking for the existence of override.conf"
 expect "this file not to exist"
+perform_test "Is update-engine override.conf absent?" "override_conf_absent" -eq 0 -eq 1 "system"
 if [[ -e /etc/systemd/system/update-engine.service.d/override.conf ]]; then
   if [[ "$do_fixup" == true ]]; then
     echo -e "${INFO}INFO:$RESETCOLOR override.conf found and fixup enabled. Attempting removal..." | tee -a "$LOGFILE"
     sudo rm /etc/systemd/system/update-engine.service.d/override.conf | tee -a "$LOGFILE"
+  else
+    echo -e "${YELLOW}ACTION:$RESETCOLOR override.conf file found, but fixup option is not enabled. Rerun script with fixup (-f) to remove this file." | tee -a "$LOGFILE"
   fi
-  echo -e "${YELLOW}ACTION:$RESETCOLOR override.conf file found, but fixup option is not enabled. Rerun script with fixup (-f) to remove this file." | tee -a "$LOGFILE"
 else
-  echo "File not found, as expected" | tee -a "$LOGFILE"
+  echo "File not found, as expected" >> "$LOGFILE"
 fi
 outro
 
@@ -1286,52 +1674,52 @@ outro
 # TODO: use ping to check if sites are resolving first, and if successful, then execute curl. The --connect-timeout option isn't working as anticipated.
 if [[ $IS_IAI_VA == true ]]; then
   intro "External connectivity: Connection test to launchdarkly (https://app.launchdarkly.com); ignores chain, outputs SSL info and HTTP status"
-  curl -vvvIik --connect-timeout $seconds_between_tests https://app.launchdarkly.com >> "$LOGFILE" 2>&1
-  perform_test "Curl test to launchdarkly; expect a result of 405" "curl -vvvIik \"https://app.launchdarkly.com\" 2>&1 | grep \"405\" | wc -l" -gt 0 -eq 0 "networking"
+  log_curl "launchdarkly" -I -k "https://app.launchdarkly.com"
+  perform_test "Curl test to launchdarkly; expect a result of 405" "curl -sS -o /dev/null -w '%{http_code}' -I -k \"https://app.launchdarkly.com\" 2>/dev/null | grep -E '405' | wc -l" -gt 0 -eq 0 "networking"
   outro
 fi
 
 #v2.3.8 - FedRAMP supports updated VA pairing
 intro "External connectivity: Connection test to the va-activation endpoint to get a code (blank response is ok)"
-curl -Svv -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" >> "$LOGFILE" 2>&1 || true
+log_curl "va-activation" -k "https://va-activation-global.secure-api.infra.identitynow.com/activation/code" || true
 outro
 
 intro "External connectivity: Connection test for SQS (https://sqs.$AWS_REGION.amazonaws.com)"
-curl -Ssv -i -L -vv --connect-timeout $seconds_between_tests "https://sqs.$AWS_REGION.amazonaws.com" >> "$LOGFILE" 2>&1
+log_curl "SQS" -L "https://sqs.$AWS_REGION.amazonaws.com"
 outro
-perform_test "Curl test to SQS; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://sqs.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"404 Not Found\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to SQS; expect a result of 404" "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout $seconds_between_tests \"https://sqs.$AWS_REGION.amazonaws.com\" 2>/dev/null | grep -E '404' | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 if [[ $ORGNAME != "mytestorg" ]]; then # Skip test when temporary config.yaml in place
   intro "External connectivity: Connection test for main URL (expected failure on vanity) https://$ORGNAME.$ISC_DOMAIN"
-  curl -Ssv -i --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_DOMAIN" >> "$LOGFILE" 2>&1
+  log_curl "IdentityNow org URL" "https://$ORGNAME.$ISC_DOMAIN"
   outro
-  perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>&1 | grep -e 'HTTP/2 302\|HTTP/1.1 302 Found' | wc -l" -gt 0 -eq 0 "networking" 
+  perform_test "Curl test to IdentityNow org; expect a result of 302" "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_DOMAIN\" 2>/dev/null | grep -E '302' | wc -l" -gt 0 -eq 0 "networking" 
   outro
 
   if [[ $IS_ORG_FEDRAMP == true ]]; then
     intro "External connectivity: Connection test for https://$ORGNAME.$ISC_ACCESS"
-    curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://$ORGNAME.$ISC_ACCESS" >> "$LOGFILE" 2>&1
+    log_curl "tenant API" -L "https://$ORGNAME.$ISC_ACCESS"
     outro
-    perform_test "Curl test to the tenant API; expect a result of 404" "curl -i --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_ACCESS\" 2>&1 | grep \"404\" | wc -l" -gt 0 -eq 0 "networking"
+    perform_test "Curl test to the tenant API; expect a result of 404" "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout $seconds_between_tests \"https://$ORGNAME.$ISC_ACCESS\" 2>/dev/null | grep -E '404' | wc -l" -gt 0 -eq 0 "networking"
     outro
   fi
 fi
 
 intro "External connectivity: Connection test for DynamoDB (https://dynamodb.$AWS_REGION.amazonaws.com)"
-curl -Ssv -i -L --connect-timeout $seconds_between_tests "https://dynamodb.$AWS_REGION.amazonaws.com" >> "$LOGFILE" 2>&1
+log_curl "DynamoDB" -L "https://dynamodb.$AWS_REGION.amazonaws.com"
 outro
-perform_test "Curl test to DynamoDB; expect a result of 200" "curl -i --connect-timeout $seconds_between_tests \"https://dynamodb.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"HTTP/1.1 200 OK\" | wc -l" -gt 0 -eq 0 "networking"
+perform_test "Curl test to DynamoDB; expect a result of 200" "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout $seconds_between_tests \"https://dynamodb.$AWS_REGION.amazonaws.com\" 2>/dev/null | grep -E '200' | wc -l" -gt 0 -eq 0 "networking"
 outro
 
 if [[ $IS_ORG_FEDRAMP == false ]]; then
   intro "External connectivity: Connection test for starport bucket in S3"
-  curl -vvv "https://prod-us-east-1-starport-layer-bucket.s3.$AWS_REGION.amazonaws.com" >> "$LOGFILE" 2>&1
-  perform_test "Curl test to starport s3 bucket" "curl -vvv --connect-timeout $seconds_between_tests \"https://prod-us-east-1-starport-layer-bucket.s3.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"403 Forbidden\" | wc -l" -gt 0 -eq 0 "networking"
+  log_curl "starport S3 bucket" "https://prod-us-east-1-starport-layer-bucket.s3.$AWS_REGION.amazonaws.com"
+  perform_test "Curl test to starport s3 bucket" "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout $seconds_between_tests \"https://prod-us-east-1-starport-layer-bucket.s3.$AWS_REGION.amazonaws.com\" 2>/dev/null | grep -E '403' | wc -l" -gt 0 -eq 0 "networking"
 else
   intro "External connectivity: Connection test for starport bucket in FedRAMP S3"
-  curl -vvv "https://s3-fips.$AWS_REGION.amazonaws.com" >> "$LOGFILE" 2>&1
-  perform_test "Curl test to FedRAMP s3" "curl -vvv --connect-timeout $seconds_between_tests \"https://s3-fips.$AWS_REGION.amazonaws.com\" 2>&1 | grep \"307 Temporary\" | wc -l" -gt 0 -eq 0 "networking"
+  log_curl "FedRAMP S3" "https://s3-fips.$AWS_REGION.amazonaws.com"
+  perform_test "Curl test to FedRAMP s3" "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout $seconds_between_tests \"https://s3-fips.$AWS_REGION.amazonaws.com\" 2>/dev/null | grep -E '307' | wc -l" -gt 0 -eq 0 "networking"
 fi
 outro
 
@@ -1345,12 +1733,13 @@ outro
 
 intro "Display network (tcp) statistics"
 expect "the number of failed connection attempts to be less than 100. If more, consider a packet capture."
+perform_test "Are TCP failed connection attempts under 100?" "get_tcp_failed_connection_attempts" -lt 100 -ge 100 "networking"
 echo "failed connection attempts:   high numbers indicate issues establishing connections, could be network, resource limits or firewall rules" >> "$LOGFILE"
 echo "connection resets received:   high numbers indicate problems with remote servers or network paths" >> "$LOGFILE" 
 echo "segments retransmitted:       indicates possible packet loss" >> "$LOGFILE"
 echo "bad segments received:        a sign of network issues" >> "$LOGFILE"
 echo "resets sent:                  high numbers indicate problems with the system rejecting connections" >> "$LOGFILE"
-echo $DIVIDER | tee -a "$LOGFILE"
+echo "$DIVIDER" >> "$LOGFILE"
 sudo netstat -st >> "$LOGFILE" 2>&1
 outro
 
@@ -1388,7 +1777,7 @@ fi
 intro "Checking Charon version"
 expect "Charon version should be higher than $CHARON_MINIMUM_VERSION"
 current_charon=$(get_current_image_tag charon) 
-perform_test "Is charon version higher than $CHARON_MINIMUM_VERSION?" "if [[ $current_charon > $CHARON_MINIMUM_VERSION ]]; then echo true; fi" "==" "true" "==" "false" "system"
+perform_test "Is charon version higher than $CHARON_MINIMUM_VERSION?" "if [[ -z '$current_charon' ]]; then echo unknown; elif [[ '$current_charon' -gt $CHARON_MINIMUM_VERSION ]]; then echo true; else echo false; fi" "==" "true" "==" "false" "system"
 echo "Current charon version is $current_charon" >> "$LOGFILE" 2>&1
 
 if [ -n "$current_charon" ] && [ "$current_charon" -lt "$CHARON_MINIMUM_VERSION" ]; then
@@ -1411,6 +1800,11 @@ fi
 outro
 
 expect "the CCG image to be updated: it should be less than 1 month old."
+intro "Running containers and resolved image versions"
+expect "each running :current container to resolve to a version tag that shares its image ID."
+print_running_container_versions >> "$LOGFILE"
+outro
+
 docker_images=$(echo "$DOCKER_IMAGES_OUTPUT" | sort)
 echo -e "$docker_images" >> "$LOGFILE"
 if echo -e "$docker_images" | grep -q "sailpoint/charon"; then
@@ -1433,7 +1827,7 @@ perform_test "Is va_agent running?" "check_container_running \"va_agent\"" "==" 
 outro
 perform_test "Is charon running?" "check_container_running \"charon\"" "==" "true" "==" "false" "system"
 outro
-perform_test "Are either fluent or vector running?" "check_container_running \"fluent\|vector\"" "==" "true" "==" "false" "system"
+perform_test "Is vector running?" "check_container_running \"vector\"" "==" "true" "==" "false" "system"
 outro
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   expect "an additional service to be running when Secure Tunnel is enabled: canal"
@@ -1455,31 +1849,37 @@ outro
 
 intro "Retrieving systemd service configuration file: charon"
 expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
+perform_test "Does charon.service unit file exist?" "service_unit_exists charon" -eq 0 -eq 1 "system"
 cat /etc/systemd/system/charon.service >> "$LOGFILE"
 outro
 
 intro "Retrieving systemd service configuration file: ccg"
 expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
+perform_test "Does ccg.service unit file exist?" "service_unit_exists ccg" -eq 0 -eq 1 "system"
 cat /etc/systemd/system/ccg.service >> "$LOGFILE"
 outro
 
 intro "Retrieving systemd service configuration file: va_agent"
 expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
+perform_test "Does va_agent.service unit file exist?" "service_unit_exists va_agent" -eq 0 -eq 1 "system"
 cat /etc/systemd/system/va_agent.service >> "$LOGFILE"
 outro
 
-intro "Retrieving systemd service configuration file: fluent"
+intro "Retrieving systemd service configuration file: vector"
 expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
-cat /etc/systemd/system/fluent.service >> "$LOGFILE"
+perform_test "Does vector.service unit file exist?" "service_unit_exists vector" -eq 0 -eq 1 "system"
+cat /etc/systemd/system/vector.service >> "$LOGFILE"
 outro
 
 intro "Retrieving systemd service configuration file: relay"
 expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
+perform_test "Does relay.service unit file exist?" "service_unit_exists relay" -eq 0 -eq 1 "system"
 cat /etc/systemd/system/relay.service >> "$LOGFILE"
 outro
 
 intro "Retrieving systemd service configuration file: toolbox"
 expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
+perform_test "Does toolbox.service unit file exist?" "service_unit_exists toolbox" -eq 0 -eq 1 "system"
 cat /etc/systemd/system/toolbox.service >> "$LOGFILE"
 outro
 
@@ -1503,6 +1903,7 @@ fi
 if [[ "$IS_CANAL_ENABLED" == true ]]; then
   intro "Retrieving systemd service configuration file: canal"
   expect "the file to exist, and contains a valid docker ECR address compared to the docker images list above."
+  perform_test "Does canal.service unit file exist?" "service_unit_exists canal" -eq 0 -eq 1 "system"
   cat /etc/systemd/system/canal.service >> "$LOGFILE"
   outro
 fi
@@ -1520,15 +1921,16 @@ lsblk -o NAME,SIZE,FSTYPE,FSSIZE,FSAVAIL,FSUSE%,MOUNTPOINT,TYPE,RO >> "$LOGFILE"
 outro
 
 intro "Retrieving disk usage stats"
-expect "the root filesystem to be less than 15% full (typically sda9 or similar). Potential a debug setting was enabled long-term."
 expect "the filesystem types to be devtmpfs, tmpfs, vfat, overlay, or ext4, and NOT btrfs"
+perform_test "Is root filesystem type not btrfs?" "root_fs_not_btrfs" -eq 0 -eq 1 "system"
 df -Th >> "$LOGFILE"
 outro
 
 intro "Checking if Root filesystem has at least $ROOT_FS_MINIMUM_FREE_KB kilobytes free"
 expect "Root filesystem should have at $ROOT_FS_MINIMUM_FREE_KB free"
-root_free_kb=$(df -k | grep " /$" | awk '{print $4}')
+root_free_kb=$(get_root_fs_free_kb)
 echo "Root FS has $root_free_kb KB free" >> "$LOGFILE" 2>&1
+perform_test "Does root filesystem have at least ${ROOT_FS_MINIMUM_FREE_KB} KB free?" "get_root_fs_free_kb" -ge "$ROOT_FS_MINIMUM_FREE_KB" -lt "$ROOT_FS_MINIMUM_FREE_KB" "system"
 if [ "$root_free_kb" -lt "$ROOT_FS_MINIMUM_FREE_KB" ]; then
   echo "Root FS has only $root_free_kb"  >> "$LOGFILE"
   if [ "$do_fixup" == true ]; then
@@ -1602,12 +2004,11 @@ if [[ "$IS_CANAL_ENABLED" == true ]]; then
   outro
 
   intro "Retrieving last 50 lines of canal service journal logs"
-  sudo journalctl --no-pager -n50 -u canal >> "$LOGFILE"
+  log_dump "canal journal (last 50)" sudo journalctl --no-pager -n50 -u canal
   outro
 
-  echo "*** Completed gathering extra data from Canal config."
-  echo "$DIVIDER"
-  echo
+  echo "*** Completed gathering extra data from Canal config." >> "$LOGFILE"
+  echo "$DIVIDER" >> "$LOGFILE"
 fi
 
 intro "Gathering logrotate service info (/usr/lib/systemd/system/logrotate.service)"
@@ -1652,28 +2053,29 @@ fi
 outro
 
 intro "Retrieving last 2 days of logrotate.timer logs"
-sudo journalctl --no-pager -u logrotate.timer -S "2 days ago" >> "$LOGFILE"
+log_dump "logrotate.timer journal (2 days)" sudo journalctl --no-pager -u logrotate.timer -S "2 days ago"
 outro
 
 intro "Retrieving last 50 lines of ccg journal logs"
-sudo journalctl --no-pager -n50 -u ccg >> "$LOGFILE"
+log_dump "ccg journal (last 50)" sudo journalctl --no-pager -n50 -u ccg
 outro
 
 intro "Retrieving last 50 lines of charon journal logs"
-sudo journalctl --no-pager -n50 -u charon >> "$LOGFILE" 
+log_dump "charon journal (last 50)" sudo journalctl --no-pager -n50 -u charon
 outro
 
 intro "Retrieving last 50 lines of va_agent journal logs"
-sudo journalctl --no-pager -n50 -u va_agent >> "$LOGFILE"
+log_dump "va_agent journal (last 50)" sudo journalctl --no-pager -n50 -u va_agent
 outro
 
 intro "Retrieving last 50 lines of otel_agent journal logs"
-sudo journalctl --no-pager -n50 -u otel_agent >> "$LOGFILE"
+log_dump "otel_agent journal (last 50)" sudo journalctl --no-pager -n50 -u otel_agent
 outro
 
 # CS0360097
 intro "Retrieving last 2 hours of update-service (update-engine) journal logs"
-sudo journalctl --no-pager -u update-engine -S "2 hours ago" >> "$LOGFILE" && sync
+log_dump "update-engine journal (2 hours)" sudo journalctl --no-pager -u update-engine -S "2 hours ago"
+sync
 if grep -q "Unknown Omaha response status: error-internal" "$LOGFILE"; then
   echo -e "${YELLOW}WARNING:$RESETCOLOR Found 'Unknown Omaha response status: error-internal'"
   echo "This indicates a machine-id conflict between this instance and the update server."
@@ -1688,49 +2090,94 @@ fi
 outro
 
 intro "Retrieving last 50 lines of kernel journal logs"
-sudo journalctl --no-pager -n50 -k >> "$LOGFILE"
+log_dump "kernel journal (last 50)" sudo journalctl --no-pager -n50 -k
 outro
 
 intro "Retrieving last 50 lines of network journal logs"
-sudo journalctl --no-pager -n50 -u systemd-networkd >> "$LOGFILE"
+log_dump "network journal (last 50)" sudo journalctl --no-pager -n50 -u systemd-networkd
 outro
 
 intro "Retrieving last 50 lines of docker-related journal logs"
-sudo journalctl --no-pager -n50 -u docker >> "$LOGFILE"
+log_dump "docker journal (last 50)" sudo journalctl --no-pager -n50 -u docker
 outro
 
-intro "Retrieving all dockerd journal logs from the last week"
-sudo journalctl --no-pager -S "1 week ago" | grep dockerd >> "$LOGFILE"
+intro "Retrieving recent dockerd journal logs"
+# Capped at 200 lines to avoid clogging the logfile with irrelevant dockerd noise.
+log_dump "dockerd journal (last 200 matching lines)" bash -c 'sudo journalctl --no-pager -S "1 week ago" | grep dockerd | tail -n 200'
 outro
 
-intro "Retrieving the last 1 hour of journal logs"
-sudo journalctl --no-pager -S "1 hour ago" >> "$LOGFILE"
+intro "Retrieving recent system journal excerpt"
+# Keep a short excerpt here; use -j when a full journal capture is needed in the zip.
+if [[ "$capture_journal" == true ]]; then
+  echo "NOTE: -j was set; including last 500 journal lines in the stuntlog." >> "$LOGFILE"
+  echo "      A fuller journal excerpt is also gathered into the zip archive." >> "$LOGFILE"
+  log_dump "system journal (last 500)" sudo journalctl --no-pager -n500
+else
+  echo "NOTE: Skipping full 1-hour journal dump to keep this log readable." >> "$LOGFILE"
+  echo "      Re-run with -j to capture a journal excerpt in the zip archive." >> "$LOGFILE"
+  log_dump "system journal (last 100)" sudo journalctl --no-pager -n100
+fi
 outro
 
 endscript
 
+# Build a plain-text summary for the logfile (no ANSI colors)
 all_test_results=$(output_all_tests_by_category)
-
-echo $DIVIDER | tee -a "$LOGFILE"
-echo "Testing summary"
-echo $DIVIDER
-echo -e "Tests passed:                           $GREEN $passes $RESETCOLOR"
-echo -e "Tests failed:                           $RED $failures $RESETCOLOR"
-echo -e "Test warnings:                          $YELLOW $warnings $RESETCOLOR"
-echo
-echo $DIVIDER
-
 summary="*** Post test summary ***
-Tests passed:   $passes 
-Tests failed:    $failures 
-Test warnings:  $warnings 
+Passed:   $passes
+Failed:   $failures
+Warnings: $warnings
+Total:    $total_tests
+"
 
-Tests:
+if [[ ${#fail_summary_lines[@]} -gt 0 ]]; then
+  summary+="
+FAILURES:"
+  for line in "${fail_summary_lines[@]}"; do
+    name="${line%%|*}"
+    out="${line#*|}"
+    summary+=$'\n'"  [ FAIL ] ${name}"
+    [[ -n "$out" ]] && summary+=$'\n'"           result: ${out}"
+  done
+  summary+=$'\n'
+fi
+
+if [[ ${#warn_summary_lines[@]} -gt 0 ]]; then
+  summary+="
+WARNINGS:"
+  for line in "${warn_summary_lines[@]}"; do
+    name="${line%%|*}"
+    out="${line#*|}"
+    summary+=$'\n'"  [ WARN ] ${name}"
+    [[ -n "$out" ]] && summary+=$'\n'"           result: ${out}"
+  done
+  summary+=$'\n'
+fi
+
+summary+="
+ALL RESULTS BY CATEGORY:
 $all_test_results"
 
-# CS0360919
+# Colored / structured summary on stdout only (keep logfile free of ANSI codes)
+print_testing_summary
+
+# Also append a plain copy at the end of the logfile for easy scanning
+{
+  echo "$DIVIDER"
+  echo "$summary"
+  echo "$DIVIDER"
+} >> "$LOGFILE"
+
+# CS0360919 - inject plain summary into the placeholder near the top of the log
 echo "$summary" > /tmp/summary_temp.txt
-awk -v var="$(cat /tmp/summary_temp.txt)" '{gsub(/<SUMMARY_BLOCK>/, var)}1' $LOGFILE > temp && mv temp $LOGFILE && sync && rm /tmp/summary_temp.txt
+awk '
+  /<SUMMARY_BLOCK>/ {
+    while ((getline line < "/tmp/summary_temp.txt") > 0) print line
+    close("/tmp/summary_temp.txt")
+    next
+  }
+  { print }
+' "$LOGFILE" > temp && mv temp "$LOGFILE" && sync && rm -f /tmp/summary_temp.txt
 
 if [ "$capture_journal" != true ] && [ "$gather_logs" == true ]; then
   # archive stuntlog, all logs in /home/sailpoint/log/ and config files in /home/sailpoint/ccg/
