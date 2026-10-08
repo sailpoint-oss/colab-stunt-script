@@ -612,7 +612,7 @@ cert_tester() {
     fi
   done
 
-  if [[ $failures > $starting_failures ]]; then
+  if [[ "$failures" -gt "$starting_failures" ]]; then
     echo "Failed or skipped certificates:"
     for cert_name in "${failed_certs[@]}"; do
       print_test_status "FAIL" "$cert_name"
@@ -904,7 +904,10 @@ check_no_proxy_validate_format() {
 }
 
 get_lscpu_num_cpus () {
-  lscpu | grep -i ^CPU\(s | awk '{print $2}'
+  # First integer on the CPU(s) line only. perform_test then compares it numerically.
+  local n
+  n=$(lscpu | grep -i '^CPU(s)' | head -n 1 | grep -oE '[0-9]+' | head -n 1)
+  echo "${n:-0}"
 }
 
 get_free_total_mem_in_gb () {
@@ -1468,7 +1471,7 @@ outro
 
 intro "Retrieving CPU information"
 expect "the number of CPU(s) to be >= 4 CPUs. This is from AWS m4.large specs."
-perform_test "Is number of CPUs greater than or equal to 4?" "get_lscpu_num_cpus" ">" 3 "<" 4 "system"
+perform_test "Is number of CPUs greater than or equal to 4?" "get_lscpu_num_cpus" -gt 3 -lt 4 "system"
 lscpu >> "$LOGFILE"
 outro
 
